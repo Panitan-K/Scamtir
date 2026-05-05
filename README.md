@@ -1,17 +1,17 @@
 <p align="center">
-  <strong>SCAMTIFY.</strong> <code>ZERO-SHOT</code>
+  <strong>SCAMTIFY.</strong> <code>GEMINI-POWERED</code>
 </p>
 
-<h1 align="center">Scamtir — Zero-Shot Sentinel Console</h1>
+<h1 align="center">Scamtir — AI Video Intelligence Console</h1>
 
 <p align="center">
-  <em>Language-driven camera AI. Stop retraining models — start detecting immediately.</em>
+  <em>Ask your camera anything. Complex natural language queries on streaming video — powered by Gemini.</em>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-UI%20Mockup-blueviolet?style=flat-square" alt="Status" />
+  <img src="https://img.shields.io/badge/status-Active%20Development-blueviolet?style=flat-square" alt="Status" />
   <img src="https://img.shields.io/badge/stack-React%20%2B%20Vite%20%2B%20TS-61dafb?style=flat-square" alt="Stack" />
-  <img src="https://img.shields.io/badge/AI-Zero--Shot%20CLIP-ff6f61?style=flat-square" alt="AI" />
+  <img src="https://img.shields.io/badge/AI-Gemini%20API-4285f4?style=flat-square" alt="AI" />
   <img src="https://img.shields.io/badge/hackathon-DOH%202026-fbbf24?style=flat-square" alt="Hackathon" />
 </p>
 
@@ -21,197 +21,139 @@
 
 | Layer | Status | Description |
 |---|---|---|
-| **Frontend Console** | ✅ Complete | React + TypeScript UI mockup — 70/30 split viewport with detection console |
-| **Vocab / Prompt System** | ✅ Complete | Text input, tag management, preset quick-prompts, confidence slider |
-| **Detection Simulation** | ✅ Complete | Mock CLIP inference pipeline with bounding box overlays and log feed |
-| **Backend API** | ❌ Not Started | FastAPI / Flask inference server for real Zero-Shot models |
-| **AI Model Pipeline** | ❌ Not Started | CLIP + Grounding DINO / OWL-ViT integration |
+| **Frontend Console** | ✅ Complete | React + TypeScript UI — video player with timestamped keyframe timeline |
+| **Natural Language Query** | ✅ Complete | Complex text queries: "person wearing white shirt raising a hand" |
+| **Keyframe Timeline** | ✅ Complete | Visual timeline with event markers, timestamps, and jump-to-moment |
+| **Gemini API Integration** | 🔧 In Progress | Gemini multimodal API for video frame analysis |
+| **Video Upload / Stream** | ✅ Complete | Upload video files or connect to live camera streams |
+| **Detection Log Feed** | ✅ Complete | Real-time system log with detection events and confidence scores |
 | **RTSP Stream Ingestion** | ❌ Not Started | Multi-camera RTSP parallel processing pipeline |
 | **Alert System** | ❌ Not Started | LINE / SMS / Webhook notification dispatcher |
-| **Prompt Library / DB** | ❌ Not Started | Supabase / PostgreSQL prompt + detection history storage |
 
-> **TL;DR** — The frontend mockup is 100% functional. Everything below the UI layer (model inference, stream processing, alerting) needs to be built.
+> **TL;DR** — The UI now features a streaming video player with a **timestamped keyframe timeline** and **complex natural language queries** powered by **Gemini API**. No more basic YOLO — this understands "person in red shirt driving a motorcycle" out of the box.
 
 ---
 
 ## 🏗️ System Architecture
 
-The full Scamtify stack consists of three major tiers: the **Frontend Console**, the **Backend Inference API**, and the **AI Model Pipeline**. Here's how they connect:
+The new Scamtir architecture is dramatically simplified by leveraging **Gemini's multimodal API** directly. No custom model training, no GPU servers — just powerful natural language video understanding out of the box.
 
 ```mermaid
 graph TB
     subgraph Frontend["🖥️ Frontend Console (This Repo)"]
         UI["React + Vite + TypeScript"]
-        VC["Vocab / Prompt Manager"]
-        VP["Camera Viewport"]
+        NLQ["Natural Language Query Input"]
+        VP["Video Player + Timeline"]
+        KF["Keyframe Timeline"]
         LOG["System Log Feed"]
     end
 
-    subgraph Backend["⚙️ Backend API (To Build)"]
-        API["FastAPI / Flask Server"]
-        Q["Task Queue (Celery / BullMQ)"]
-        WS["WebSocket Push"]
-        DB["PostgreSQL / Supabase"]
-    end
-
-    subgraph AI["🧠 AI Model Pipeline (To Build)"]
-        CLIP["CLIP ViT-L/14 Encoder"]
-        GDINO["Grounding DINO / OWL-ViT"]
-        PP["Post-Processing & NMS"]
+    subgraph GeminiAPI["🧠 Gemini Multimodal API"]
+        GM["Gemini 2.5 Flash"]
+        VU["Video Understanding"]
+        NLU["Natural Language Processing"]
     end
 
     subgraph Infra["📡 Infrastructure"]
         RTSP["RTSP Stream Ingestion"]
-        GPU["GPU Server (CUDA)"]
         S3["Object Storage (S3/R2)"]
         ALERT["Alert Dispatcher"]
     end
 
-    UI -->|REST / WebSocket| API
-    VC -->|Vocab + Threshold| API
-    API --> Q
-    Q --> CLIP
-    Q --> GDINO
-    CLIP -->|Text Embedding| PP
-    GDINO -->|Bounding Boxes| PP
-    PP -->|Detections JSON| WS
-    WS -->|Real-time results| VP
-    WS -->|Log entries| LOG
-    RTSP -->|Frames| Q
-    GPU --- CLIP
-    GPU --- GDINO
-    PP -->|Snapshots| S3
-    PP -->|Alerts| ALERT
-    API --> DB
+    NLQ -->|Complex text query| GM
+    VP -->|Video frames| VU
+    GM -->|Analysis results| KF
+    GM -->|Detection events| LOG
+    VU -->|Scene understanding| NLU
+    NLU -->|Timestamped matches| KF
+    RTSP -->|Frames| VP
+    GM -->|Snapshots| S3
+    GM -->|Alerts| ALERT
     ALERT -->|LINE / SMS / Webhook| EXT["External Systems"]
 ```
 
+### Why Gemini API?
+
+| Approach | Old (YOLO / CLIP) | New (Gemini API) |
+|---|---|---|
+| **Query Complexity** | Simple object labels only | Full natural language: "person in red shirt driving motorcycle" |
+| **Setup Time** | Weeks (GPU, model training) | Hours (API key + prompt) |
+| **Infrastructure** | GPU server required ($1+/hr) | API calls only |
+| **Accuracy** | Limited to trained classes | Understands context, actions, clothing, interactions |
+| **Demo Speed** | Slow to build convincing demo | Immediate, impressive results |
+
 ---
 
-## 🔬 Zero-Shot Detection Pipeline
+## 🔬 Gemini Video Intelligence Pipeline
 
-The core innovation of Scamtify is the **text-to-detection** pipeline. Instead of training a model on thousands of labeled images, operators simply type what they want to detect in natural language.
+The core innovation is the **natural language video query** pipeline. Operators describe exactly what they're looking for in plain language — no more basic object labels.
 
 ```mermaid
 sequenceDiagram
     participant User as 👤 Operator
     participant Console as 🖥️ Console UI
-    participant API as ⚙️ API Server
-    participant CLIP as 🧠 CLIP Encoder
-    participant DINO as 🦕 Grounding DINO
+    participant Gemini as 🧠 Gemini API
+    participant Timeline as 📊 Keyframe Timeline
     participant Alert as 📢 Alert System
 
-    User->>Console: Types "person holding wire"
-    User->>Console: Sets confidence threshold (45%)
-    User->>Console: Clicks "Run Detection"
-    Console->>API: POST /detect {vocabs, threshold, image}
+    User->>Console: Types "person wearing white shirt raising a hand"
+    User->>Console: Uploads video or connects to stream
+    User->>Console: Clicks "Analyze Video"
+    Console->>Gemini: POST frames + natural language query
     
-    API->>CLIP: Encode text prompts → text embeddings
-    API->>CLIP: Encode image frame → image embedding
-    CLIP-->>API: Similarity scores per prompt
+    Gemini->>Gemini: Multimodal analysis (video + text)
+    Gemini-->>Console: Timestamped detections[]
     
-    API->>DINO: Forward image + text prompts
-    DINO-->>API: Bounding boxes + confidence scores
+    Console->>Timeline: Render keyframe markers at matched timestamps
+    Console->>Console: Append log entries with timestamps
     
-    API->>API: Post-process: NMS, threshold filter
-    API-->>Console: WebSocket → detections[]
+    User->>Timeline: Clicks keyframe marker at 02:34
+    Timeline->>Console: Jump video to 02:34
+    Console->>Console: Highlight detection at that moment
     
-    Console->>Console: Render bounding boxes on viewport
-    Console->>Console: Append log entries
-    
-    alt Confidence > Alert Threshold
-        API->>Alert: Trigger LINE / SMS notification
-        Alert-->>User: 🚨 "Match found: Cam 12 (KM 42.5)"
+    alt High Confidence Match
+        Console->>Alert: Trigger LINE / SMS notification
+        Alert-->>User: 🚨 "Match at 02:34: white shirt, hand raised"
     end
 ```
 
 ---
 
 ## 🧰 What You Need to Build This
+## 🧰 What You Need to Build This
 
-### Infrastructure Requirements
+### Infrastructure Requirements (Simplified!)
 
 ```mermaid
 graph LR
-    subgraph Required["🔴 Required Infrastructure"]
-        G["GPU Server<br/>NVIDIA T4/A10G+<br/>(min 16GB VRAM)"]
-        C["Compute Server<br/>8+ vCPU, 32GB RAM"]
-        N["Network<br/>Low-latency to<br/>RTSP camera feeds"]
+    subgraph Required["✅ Required"]
+        API["Gemini API Key<br/>(Free tier available)"]
+        FE["Frontend Server<br/>Any hosting (Vercel, etc.)"]
+        N["Network<br/>Internet access"]
     end
 
-    subgraph Cloud["☁️ Cloud Options"]
-        AWS["AWS EC2 g5.xlarge<br/>~$1.01/hr"]
-        GCP["GCP L4 VM<br/>~$0.81/hr"]
-        AZ["Azure NC-series<br/>~$0.90/hr"]
-        RUN["RunPod / Vast.ai<br/>~$0.40/hr (spot)"]
+    subgraph Optional["☁️ Optional (Scale)"]
+        RTSP["RTSP Gateway<br/>For live camera feeds"]
+        S3["Object Storage<br/>Video archive"]
+        ALERT["Alert Service<br/>LINE / SMS"]
     end
 
-    subgraph OnPrem["🏢 On-Premise Options"]
-        JET["NVIDIA Jetson Orin<br/>(Edge inference)"]
-        WS["GPU Workstation<br/>RTX 4090 / A6000"]
-    end
-
-    Required --> Cloud
-    Required --> OnPrem
+    Required --> Optional
 ```
 
-### Detailed Resource Breakdown
-
-| Resource | Minimum Spec | Recommended | Purpose |
-|---|---|---|---|
-| **GPU** | NVIDIA T4 (16GB) | A10G / A100 (24–80GB) | Model inference (CLIP + Grounding DINO) |
-| **CPU** | 8 vCPU | 16+ vCPU | RTSP decoding, pre/post-processing |
-| **RAM** | 32 GB | 64 GB | Frame buffers, model weights cache |
-| **Storage** | 100 GB SSD | 500 GB NVMe | Model weights (~5 GB), frame cache, logs |
-| **Network** | 100 Mbps | 1 Gbps | RTSP streams (~4 Mbps per 1080p cam) |
-| **CUDA** | 11.8+ | 12.x | PyTorch / ONNX Runtime GPU backend |
+> **Key Insight:** By using Gemini API, we eliminated the need for GPU servers, model training, and complex ML infrastructure. The entire system runs on API calls.
 
 ### Software Stack
 
 | Layer | Technology | Why |
 |---|---|---|
 | **Frontend** | React + Vite + TypeScript | Already built (this repo) |
-| **Backend API** | Python FastAPI | Async, fast, OpenAPI docs, WebSocket support |
-| **AI — Classification** | CLIP ViT-L/14 (OpenAI) | Zero-shot text-image similarity, ~76% ImageNet |
-| **AI — Detection** | Grounding DINO 1.5 | Open-vocabulary object detection from text prompts |
-| **AI — Alternative** | OWL-ViT v2 (Google) | Lighter alternative, runs on T4 |
-| **AI Runtime** | PyTorch 2.x + ONNX Runtime | GPU-accelerated inference |
-| **Stream Processing** | FFmpeg + OpenCV | RTSP → frame extraction pipeline |
-| **Task Queue** | Celery + Redis | Parallel multi-camera processing |
-| **Database** | Supabase (PostgreSQL) | Prompt library, detection history, user auth |
-| **Object Storage** | AWS S3 / Cloudflare R2 | Detection snapshots & evidence archival |
+| **AI Engine** | Gemini 2.5 Flash API | Multimodal video understanding, complex NL queries |
+| **Video Processing** | HTML5 Video + Canvas API | Frame extraction in the browser |
+| **Stream Processing** | FFmpeg (optional) | RTSP → frame extraction for live cameras |
+| **Database** | Supabase (PostgreSQL) | Query history, detection logs |
+| **Object Storage** | AWS S3 / Cloudflare R2 | Video archive & evidence snapshots |
 | **Alerting** | LINE Messaging API + Twilio | Push notifications to patrol officers |
-| **Monitoring** | Grafana + Prometheus | GPU utilization, inference latency, uptime |
-
-### Python Dependencies (Backend — To Create)
-
-```
-# Core
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-python-multipart>=0.0.9
-websockets>=12.0
-
-# AI Models
-torch>=2.3.0
-torchvision>=0.18.0
-transformers>=4.42.0          # Hugging Face (OWL-ViT, CLIP)
-open-clip-torch>=2.26.0       # OpenCLIP community checkpoints
-groundingdino-py>=0.4.0       # Grounding DINO
-
-# Stream Processing
-opencv-python-headless>=4.10.0
-ffmpeg-python>=0.2.0
-
-# Task Queue
-celery[redis]>=5.4.0
-
-# Database
-supabase>=2.7.0
-
-# Alerting
-line-bot-sdk>=3.11.0
-```
 
 ---
 
@@ -219,85 +161,78 @@ line-bot-sdk>=3.11.0
 
 ```mermaid
 gantt
-    title Scamtify Implementation Roadmap
+    title Scamtir Implementation Roadmap
     dateFormat  YYYY-MM
     axisFormat  %b %Y
 
-    section Phase 0 — Current
-    UI Mockup (this repo)               :done, p0, 2026-04, 2026-05
+    section Phase 0 — Foundation
+    UI Console v1 (YOLO-based)           :done, p0a, 2026-04, 2026-05
+    Architecture Pivot to Gemini API     :done, p0b, 2026-05, 2026-05
 
-    section Phase 1 — Proof of Concept (Month 1–3)
-    Backend API scaffold (FastAPI)       :p1a, 2026-05, 2026-06
-    CLIP + Grounding DINO integration    :p1b, 2026-05, 2026-07
-    Single-image detection endpoint      :p1c, after p1b, 30d
-    Connect frontend → real API          :p1d, after p1c, 14d
+    section Phase 1 — Gemini Integration (Month 1–2)
+    Gemini API integration               :active, p1a, 2026-05, 2026-06
+    Video upload + frame extraction      :p1b, 2026-05, 2026-06
+    Timestamped keyframe timeline        :p1c, 2026-05, 2026-06
+    Complex NL query interface           :p1d, after p1a, 30d
     10–20 DOH cameras pilot             :p1e, after p1d, 30d
-    Accuracy benchmark report           :p1f, after p1e, 14d
 
-    section Phase 2 — Regional Rollout (Month 4–9)
-    RTSP multi-stream ingestion         :p2a, 2026-08, 60d
-    Celery parallel processing          :p2b, after p2a, 30d
-    Prompt Library (Supabase CRUD)      :p2c, 2026-08, 45d
-    LINE / SMS alert integration        :p2d, after p2c, 30d
-    Expand to 200–500 cameras           :p2e, 2026-10, 60d
-    Officer training program            :p2f, after p2e, 30d
+    section Phase 2 — Regional Rollout (Month 3–6)
+    RTSP live stream integration         :p2a, 2026-07, 60d
+    Query history & prompt library       :p2b, 2026-07, 45d
+    LINE / SMS alert integration         :p2c, after p2b, 30d
+    Expand to 200–500 cameras            :p2e, 2026-09, 60d
 
-    section Phase 3 — National Scale (Month 10–18)
-    Central AI Command Center           :p3a, 2027-02, 90d
-    4000+ camera coverage               :p3b, after p3a, 90d
-    Auto-Dispatch (Highway Patrol)      :p3c, after p3a, 60d
-    SaaS multi-tenant platform          :p3d, 2027-05, 90d
+    section Phase 3 — National Scale (Month 7–12)
+    Central AI Command Center            :p3a, 2026-11, 90d
+    4000+ camera coverage                :p3b, after p3a, 90d
+    SaaS multi-tenant platform           :p3d, 2027-02, 90d
 ```
 
-### Phase 0 — Current State ✅
+### Phase 0 — Foundation ✅
 
-> **What exists today: This repository.**
+> **Architecture pivot: YOLO → Gemini API**
 
 - [x] React + TypeScript + Vite frontend
-- [x] 70/30 split layout (viewport + console)
-- [x] Text-to-detection vocabulary manager
-- [x] Quick preset system (Cable Theft, Road Hazard, Traffic Anomaly, Safety Compliance)
-- [x] Confidence threshold slider
-- [x] Mock CLIP inference simulation with bounding box overlays
+- [x] Video player with streaming support
+- [x] Timestamped keyframe timeline with event markers
+- [x] Natural language query input (complex queries)
+- [x] Query preset system for common scenarios
 - [x] Real-time system log feed
-- [x] Image upload + grid/scan overlays
-- [ ] No real AI model connected — all detections are simulated
+- [x] Architecture decision: Gemini API over custom YOLO pipeline
+- [ ] Gemini API key integration (next step)
 
-### Phase 1 — Proof of Concept (Month 1–3) | Budget: ~500K THB
+### Phase 1 — Gemini Integration (Month 1–2) | Budget: ~100K THB
 
-**Goal:** Connect real Zero-Shot models to the console UI and validate on 10–20 DOH CCTV cameras.
-
-| Task | Stack | Deliverable |
-|---|---|---|
-| Backend API scaffold | FastAPI + Uvicorn | `/detect`, `/vocab`, `/health` endpoints |
-| Model integration | CLIP ViT-L/14 + Grounding DINO 1.5 | Single-image zero-shot detection |
-| Frontend ↔ API wiring | WebSocket + REST | Real bounding boxes on viewport |
-| GPU provisioning | AWS g5.xlarge or RunPod | 1× A10G instance |
-| DOH pilot install | RTSP → FFmpeg | 10–20 cameras, 1 highway section |
-| Accuracy report | Python + Jupyter | Precision/Recall vs. manual annotation |
-
-### Phase 2 — Regional Rollout (Month 4–9) | Budget: ~2.5M THB
-
-**Goal:** Scale to 200–500 cameras across 3–5 highway divisions with production alerting.
+**Goal:** Wire Gemini API for real video analysis with natural language queries.
 
 | Task | Stack | Deliverable |
 |---|---|---|
-| Multi-RTSP ingestion | FFmpeg + OpenCV + Celery | Parallel frame extraction at scale |
-| Prompt Library | Supabase + CRUD API | Saved, reusable detection prompts per zone |
+| Gemini API integration | Gemini 2.5 Flash | Video frame analysis endpoint |
+| Frame extraction | Canvas API | Extract key frames from uploaded video |
+| Keyframe matching | Gemini + Timeline | Timestamped detection events on timeline |
+| NL Query engine | Gemini multimodal | "Person in red shirt on motorcycle" → timestamps |
+| DOH pilot | RTSP → Frames | 10–20 cameras, 1 highway section |
+
+### Phase 2 — Regional Rollout (Month 3–6) | Budget: ~1.5M THB
+
+**Goal:** Scale to 200–500 cameras with production alerting.
+
+| Task | Stack | Deliverable |
+|---|---|---|
+| RTSP live streams | FFmpeg + WebSocket | Real-time camera feed ingestion |
+| Query Library | Supabase + CRUD API | Saved, reusable queries per zone |
 | Alert system | LINE Messaging API + SMS | Real-time push to patrol officers |
-| Dashboard analytics | Grafana + Prometheus | Detection volume, latency, GPU utilization |
-| Officer training | Workshops + docs | Field training for 50+ officers |
+| Dashboard analytics | Grafana + Prometheus | Query volume, response times |
 
-### Phase 3 — National Scale (Month 10–18) | Budget: ~8M THB
+### Phase 3 — National Scale (Month 7–12) | Budget: ~5M THB
 
-**Goal:** Cover 4,000+ cameras nationwide, Central AI Command Center, SaaS expansion.
+**Goal:** Cover 4,000+ cameras nationwide, Central AI Command Center.
 
 | Task | Stack | Deliverable |
 |---|---|---|
 | Central Command Center | React dashboard + map | National real-time monitoring |
 | Auto-Dispatch | Integration with Highway Patrol | Automated incident → patrol assignment |
 | Multi-tenant SaaS | Auth, billing, tenant isolation | Platform for other agencies & private sector |
-| Edge inference | NVIDIA Jetson Orin | On-premise option for sensitive sites |
 
 ---
 
@@ -305,7 +240,7 @@ gantt
 
 ```mermaid
 mindmap
-  root((Scamtify<br/>Zero-Shot))
+  root((Scamtir<br/>Gemini-Powered))
     🛣️ Highways
       Cable Theft Detection
       Road Hazard / Debris
@@ -314,32 +249,28 @@ mindmap
     🏢 Real Estate
       Security Guard Monitoring
       Suspicious Vehicle Detection
-      Dangerous Animal Detection
       Package Theft Prevention
     🛒 Modern Trade
       Shoplifting Detection
       Abandoned Bag Alert
       Crowd Density Monitoring
-      Queue Length Optimization
     🏭 Manufacturing
       PPE Compliance
-      Hand-Near-Blade Detection
-      IoT Emergency Stop
       Zone Intrusion Alert
     🧪 R&D Frontier
-      Video Action Recognition
-      Thai-Language Prompts
-      Few-Shot Fine-Tuning
-      Edge Deployment (Jetson)
+      Real-time Streaming Analysis
+      Thai-Language Queries
+      Multi-camera Correlation
+      Edge + API Hybrid
 ```
 
 ### Technical R&D Priorities
 
-1. **Video-level Zero-Shot Action Recognition** — Move beyond single-frame to temporal action detection (e.g., "person climbing fence" over 3 seconds)
-2. **Thai-Language Prompt Support** — Fine-tune CLIP text encoder for Thai prompts ("คนกำลังถือสายไฟ") via multilingual CLIP or translation layer
-3. **Few-Shot Fine-Tuning Loop** — Allow operators to correct false positives/negatives → auto fine-tune adapter layers (LoRA) without full retraining
-4. **Edge Deployment** — Quantize models (INT8/FP16) for NVIDIA Jetson Orin Nano — run inference at the camera level, send alerts only
-5. **Federated Prompt Sharing** — Cross-agency prompt library marketplace (e.g., DOH shares "road debris" prompts with DLT)
+1. **Real-time Streaming Analysis** — Continuous frame-by-frame Gemini analysis on live RTSP streams
+2. **Thai-Language Query Support** — Full Thai natural language queries ("คนใส่เสื้อแดงขับมอเตอร์ไซค์") via Gemini's multilingual capability
+3. **Multi-camera Correlation** — Cross-reference detections across multiple cameras to track subjects
+4. **Edge + API Hybrid** — Use lightweight edge models for pre-filtering, Gemini API for complex queries
+5. **Query DSL** — Build a domain-specific query language for power users beyond natural language
 
 ---
 
@@ -349,6 +280,7 @@ mindmap
 
 - Node.js ≥ 18
 - pnpm ≥ 8
+- Gemini API key (get one at [ai.google.dev](https://ai.google.dev))
 
 ### Install & Run
 
@@ -361,13 +293,13 @@ pnpm run dev
 
 ### Usage
 
-1. **Upload an image** — Click the upload zone or drag & drop a JPG/PNG/WebP
-2. **Add detection prompts** — Type what you want to detect (e.g., `"fallen tree on road"`)
-3. **Or load a preset** — Click Cable Theft / Road Hazard / Traffic Anomaly / Safety Compliance
-4. **Adjust confidence** — Slide the threshold (default 45%)
-5. **Run detection** — Click the gradient button and watch the simulated pipeline in the log feed
+1. **Upload a video** — Click the upload zone or drag & drop an MP4/WebM file
+2. **Write a natural language query** — Describe exactly what you're looking for (e.g., `"person wearing white shirt raising a hand"`)
+3. **Or load a preset** — Click one of the quick query presets
+4. **Analyze** — Click the "Analyze Video" button to process with Gemini
+5. **Browse keyframes** — Click markers on the timeline to jump to detected moments
 
-> ⚠️ **Note:** All detections are currently simulated. Connecting to real CLIP / Grounding DINO models requires the backend (Phase 1).
+> ⚠️ **Note:** Gemini API integration is in progress. The UI is fully functional with simulated keyframe data for demo purposes.
 
 ---
 
@@ -381,8 +313,8 @@ Scamtir/
 ├── tsconfig.json           # TypeScript config
 ├── src/
 │   ├── main.tsx            # React entry point
-│   ├── App.tsx             # Main app — viewport + console layout
-│   ├── App.css             # All component styles (70/30 layout)
+│   ├── App.tsx             # Main app — video player + query console + timeline
+│   ├── App.css             # All component styles
 │   └── index.css           # Design system tokens + animations
 └── public/
     └── vite.svg            # Favicon
@@ -392,13 +324,13 @@ Scamtir/
 
 ## 📚 References
 
-- [CLIP — Learning Transferable Visual Models (OpenAI, 2021)](https://arxiv.org/abs/2103.00020)
-- [Grounding DINO — Marrying DINO with Grounded Pre-Training (2023)](https://arxiv.org/abs/2303.05499)
-- [OWL-ViT — Simple Open-Vocabulary Object Detection (Google, 2022)](https://arxiv.org/abs/2205.06230)
+- [Gemini API — Multimodal AI (Google DeepMind)](https://ai.google.dev/gemini-api)
+- [Gemini Vision — Video Understanding](https://ai.google.dev/gemini-api/docs/vision)
 - [DOH Highway Traffic Camera System](https://www.doh.go.th)
+- [CLIP — Learning Transferable Visual Models (OpenAI, 2021)](https://arxiv.org/abs/2103.00020) *(legacy reference)*
 
 ---
 
 <p align="center">
-  <sub>© 2026 Scamtify Zero-Shot Systems · Built for DOH Innovation Hackathon</sub>
+  <sub>© 2026 Scamtify AI Systems · Built for DOH Innovation Hackathon</sub>
 </p>
