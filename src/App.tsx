@@ -132,13 +132,16 @@ async function uploadAndAnalyzeVideo(apiKey: string, videoFile: File, query: str
   onLog('Video is ACTIVE. Running analysis query...');
 
   // 3. Generate Content
-  const systemPrompt = `Analyze the video and identify precise segments for the query: "${query}".
-Return ONLY a JSON array of events. Each event must be an object with:
+  const systemPrompt = `You are an AI Video Verification Engine.
+You are analyzing a video clip to find segments matching the query: "${query}".
+Your task is to verify this claim and provide reasoning. Look closely at the motion and interaction between entities.
+Return ONLY a JSON array of events. Each event must be an object with the following schema:
 - "start_time_seconds": number (the exact start timestamp in seconds)
 - "end_time_seconds": number (the exact end timestamp in seconds)
-- "bounding_box_2d": An array of 4 numbers [ymin, xmin, ymax, xmax] normalized between 0 and 1000, tightly bounding the detected object or action. If a box cannot be drawn, return null.
-- "description": string (brief description of the match)
-- "confidence": number (float between 0.0 and 1.0)
+- "is_verified": boolean (True if the "${query}" actually occurred)
+- "reasoning": string (Provide a 1-sentence step-by-step reasoning of what physically happened to justify your verification)
+- "feedback": string (If not verified, explain what the objects were actually doing)
+- "bounding_box_2d": array of 4 numbers [ymin, xmin, ymax, xmax] normalized between 0 and 1000. If a box cannot be drawn, return null.
 If nothing matches, return [].`;
 
   const genRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
@@ -163,20 +166,27 @@ If nothing matches, return [].`;
   }
 
   const genData = await genRes.json();
-  // With responseMimeType: "application/json", the text IS a json string.
   const text = genData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-  const detections = JSON.parse(text) as Array<{ start_time_seconds: number; end_time_seconds: number; bounding_box_2d: [number, number, number, number] | null; description: string; confidence: number }>;
+  const detections = JSON.parse(text) as Array<{ start_time_seconds: number; end_time_seconds: number; is_verified: boolean; reasoning: string; feedback?: string; bounding_box_2d: [number, number, number, number] | null; confidence?: number }>;
 
-  return detections.map((d, i) => {
+  // Log feedback for unverified events to help the user understand why it failed
+  const unverified = detections.find(d => d.is_verified === false);
+  if (unverified) {
+    onLog(`💡 Model Feedback: ${unverified.feedback || unverified.reasoning}`);
+  }
+
+  const verifiedDetections = detections.filter(d => d.is_verified !== false);
+
+  return verifiedDetections.map((d, i) => {
     const start = d.start_time_seconds || 0;
-    const end = d.end_time_seconds || start + 1; // Fallback to 1s duration
+    const end = d.end_time_seconds || start + 1;
     return {
       id: ++keyframeIdCounter,
       timeSeconds: start,
       duration: [start, Math.max(start, end)],
       boundingBox: d.bounding_box_2d || null,
-      label: d.description || query,
-      confidence: Math.max(0, Math.min(1, d.confidence || 1)),
+      label: d.reasoning || query,
+      confidence: d.confidence || 0.95, // Fallback if confidence isn't strictly requested
       color: KEYFRAME_COLORS[i % KEYFRAME_COLORS.length],
     };
   });
