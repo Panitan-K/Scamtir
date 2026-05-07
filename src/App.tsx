@@ -1,4 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import './App.css';
 
 const ENV_API_KEY = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined)?.trim();
@@ -88,19 +90,86 @@ function formatVideoTime(seconds: number): string {
 
 let keyframeIdCounter = 0;
 
-// Upload video and poll until active via Gemini File API
-async function uploadAndAnalyzeVideo(apiKey: string, videoFile: File, query: string, onLog: (msg: string) => void): Promise<Keyframe[]> {
-  // 1. Upload
-  onLog(`Uploading ${videoFile.name} (${(videoFile.size / 1024 / 1024).toFixed(1)}MB) via Gemini File API...`);
+let ffmpegInstance: FFmpeg | null = null;
+let ffmpegLoadingPromise: Promise<FFmpeg> | null = null;
+
+async function getFFmpeg() {
+  if (ffmpegInstance) return ffmpegInstance;
+  if (ffmpegLoadingPromise) return ffmpegLoadingPromise;
+
+  ffmpegLoadingPromise = (async () => {
+    const ffmpeg = new FFmpeg();
+    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+    });
+    ffmpegInstance = ffmpeg;
+    return ffmpeg;
+  })();
+
+  try {
+    return await ffmpegLoadingPromise;
+  } catch (err) {
+    ffmpegLoadingPromise = null;
+    throw err;
+  }
+}
+
+async function compressVideoClientSide(videoFile: File, onLog: (msg: string) => void): Promise<File> {
+  // If the file is already small (< 5MB), skip compression to save time
+  if (videoFile.size < 5 * 1024 * 1024) {
+    onLog(`[Optimization] Video is small enough (${(videoFile.size / 1024 / 1024).toFixed(1)}MB). Skipping compression.`);
+    return videoFile;
+  }
+
+  onLog(`[Optimization] Loading WebAssembly FFmpeg for in-browser compression...`);
+  const ff = await getFFmpeg();
+
+  onLog(`[Optimization] Transcoding to 360p @ 2 FPS to reduce payload...`);
+  const inputName = 'input.mp4';
+  const outputName = 'output.mp4';
+
+  await ff.writeFile(inputName, await fetchFile(videoFile));
+
+  // Run ffmpeg: scale to 640px max width, 2 frames per second (plenty for Gemini screening), ultra fast preset, drop audio
+  const exitCode = await ff.exec([
+    '-i', inputName,
+    '-vf', 'scale=640:-2,fps=2',
+    '-c:v', 'libx264',
+    '-crf', '30',
+    '-preset', 'ultrafast',
+    '-an',
+    outputName
+  ]);
+
+  if (exitCode !== 0) {
+    throw new Error(`FFmpeg transcoding failed with exit code ${exitCode}. The video format may not be supported for in-browser compression.`);
+  }
+
+  const data = await ff.readFile(outputName);
+  const blob = new Blob([new Uint8Array(data as Uint8Array)], { type: 'video/mp4' });
+
+  onLog(`[Optimization] ✅ Compressed from ${(videoFile.size / 1024 / 1024).toFixed(1)}MB down to ${(blob.size / 1024 / 1024).toFixed(1)}MB!`);
+
+  return new File([blob], 'opt_' + videoFile.name, { type: 'video/mp4' });
+}
+
+// Upload video via Gemini File API and poll until ACTIVE
+async function uploadVideoToGemini(apiKey: string, videoFile: File, onLog: (msg: string) => void): Promise<{ fileUri: string; mimeType: string; fileName: string }> {
+  // Compress before upload!
+  const optimizedFile = await compressVideoClientSide(videoFile, onLog);
+
+  onLog(`Uploading ${optimizedFile.name} (${(optimizedFile.size / 1024 / 1024).toFixed(1)}MB) via Gemini File API...`);
   const uploadRes = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey.trim()}`, {
     method: 'POST',
     headers: {
       'X-Goog-Upload-Command': 'upload, finalize',
-      'X-Goog-Upload-Header-Content-Length': videoFile.size.toString(),
-      'X-Goog-Upload-Header-Content-Type': videoFile.type || 'video/mp4',
-      'Content-Type': videoFile.type || 'video/mp4'
+      'X-Goog-Upload-Header-Content-Length': optimizedFile.size.toString(),
+      'X-Goog-Upload-Header-Content-Type': optimizedFile.type || 'video/mp4',
+      'Content-Type': optimizedFile.type || 'video/mp4'
     },
-    body: videoFile
+    body: optimizedFile
   });
 
   if (!uploadRes.ok) {
@@ -112,7 +181,7 @@ async function uploadAndAnalyzeVideo(apiKey: string, videoFile: File, query: str
   const fileUri = fileInfo.file.uri;
   onLog(`Upload complete. File URI: ${fileUri}`);
 
-  // 2. Poll for processing
+  // Poll for processing
   let fileState = 'PROCESSING';
   let attempts = 0;
   while (fileState === 'PROCESSING') {
@@ -129,68 +198,330 @@ async function uploadAndAnalyzeVideo(apiKey: string, videoFile: File, query: str
     throw new Error("Video processing failed on Google's servers.");
   }
 
-  onLog('Video is ACTIVE. Running analysis query...');
+  onLog('✅ Video is ACTIVE on Gemini.');
+  return { fileUri, mimeType: fileInfo.file.mimeType, fileName };
+}
 
-  // 3. Generate Content
-  const systemPrompt = `You are an AI Video Verification Engine.
-You are analyzing a video clip to find segments matching the query: "${query}".
-Your task is to verify this claim and provide reasoning. Look closely at the motion and interaction between entities.
-Return ONLY a JSON array of events. Each event must be an object with the following schema:
-- "start_time_seconds": number (the exact start timestamp in seconds)
-- "end_time_seconds": number (the exact end timestamp in seconds)
-- "is_verified": boolean (True if the "${query}" actually occurred)
-- "reasoning": string (Provide a 1-sentence step-by-step reasoning of what physically happened to justify your verification)
-- "feedback": string (If not verified, explain what the objects were actually doing)
-- "bounding_box_2d": array of 4 numbers [ymin, xmin, ymax, xmax] normalized between 0 and 1000. If a box cannot be drawn, return null.
-If nothing matches, return [].`;
+// ===== PIPELINE CONSTANTS =====
+const BATCH_SIZE_SEC = 8;          // Phase 1: screening batch length (transformers handle short clips better)
+const PADDING_SEC = 5;             // Phase 2: ±5s window around each flagged second
+const SCREEN_CONCURRENCY = 4;      // Max parallel Gemini screening calls
+const YOLO_WINDOW_FPS = 3;         // Phase 2: 3 FPS × 10s = 30 annotated frames
 
-  const genRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
+interface FlaggedMoment {
+  flagged_sec: number;
+  confidence: number;
+  description: string;
+}
+
+// Step 1: Gemini Batch Screening — chop video into <10s windows, ask each for the EXACT second of the event
+async function geminiBatchScreen(
+  apiKey: string,
+  fileUri: string,
+  mimeType: string,
+  query: string,
+  videoDurationSec: number,
+  scanStart: number,
+  scanEnd: number,
+  onLog: (msg: string) => void
+): Promise<FlaggedMoment[]> {
+  const start = Math.max(0, Math.floor(scanStart));
+  const end = Math.min(Math.ceil(scanEnd > 0 ? scanEnd : videoDurationSec), Math.ceil(videoDurationSec));
+
+  const batches: Array<{ start: number; end: number }> = [];
+  for (let s = start; s < end; s += BATCH_SIZE_SEC) {
+    const e = Math.min(s + BATCH_SIZE_SEC, end);
+    if (e - s >= 1) batches.push({ start: s, end: e });
+  }
+  onLog(`📦 Phase 1: Screening ${batches.length} batch(es) of ≤${BATCH_SIZE_SEC}s for "${query}"...`);
+
+  const screenPrompt = `You are a video screening engine.
+Watch this short clip carefully and identify the EXACT second(s) when this occurs: "${query}"
+
+Return ONLY a JSON array. Each item must have:
+- "flagged_sec": number (the precise second in the ORIGINAL full video where the event occurs — use the timestamps you observe in this clip)
+- "confidence": number between 0 and 1
+- "description": string (one short sentence describing what you saw at that moment)
+
+Be precise. Pick the single most representative second per event. If multiple distinct events happen, list each.
+If nothing in this clip matches, return [].`;
+
+  async function screenOne(batch: { start: number; end: number }): Promise<FlaggedMoment[]> {
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              {
+                fileData: { fileUri, mimeType },
+                videoMetadata: {
+                  startOffset: `${batch.start}s`,
+                  endOffset: `${batch.end}s`
+                }
+              },
+              { text: screenPrompt }
+            ]
+          }],
+          generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
+        })
+      });
+      if (!res.ok) {
+        onLog(`   ⚠️ Batch ${batch.start}-${batch.end}s screen failed: ${res.status}`);
+        return [];
+      }
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+      const arr: any[] = JSON.parse(text);
+      const moments = arr
+        .filter(x => typeof x.flagged_sec === 'number')
+        .map(x => ({
+          flagged_sec: Math.max(batch.start, Math.min(batch.end, Number(x.flagged_sec))),
+          confidence: Math.max(0, Math.min(1, Number(x.confidence) || 0.5)),
+          description: String(x.description || query),
+        }));
+      if (moments.length > 0) {
+        onLog(`   📍 Batch ${batch.start}-${batch.end}s: ${moments.length} moment(s) flagged.`);
+      }
+      return moments;
+    } catch (err) {
+      onLog(`   ⚠️ Batch ${batch.start}-${batch.end}s exception: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+  }
+
+  const results: FlaggedMoment[] = [];
+  for (let i = 0; i < batches.length; i += SCREEN_CONCURRENCY) {
+    const slice = batches.slice(i, i + SCREEN_CONCURRENCY);
+    const out = await Promise.all(slice.map(screenOne));
+    out.forEach(m => results.push(...m));
+  }
+
+  results.sort((a, b) => a.flagged_sec - b.flagged_sec);
+  onLog(`📋 Phase 1 complete: ${results.length} flagged moment(s) total.`);
+  results.forEach(m => onLog(`   ⏱ ${m.flagged_sec.toFixed(1)}s (${(m.confidence * 100).toFixed(0)}%) — ${m.description}`));
+  return results;
+}
+
+// Helper: merge nearby flagged seconds into ±padSec windows so YOLO doesn't redo overlapping work
+function buildMergedWindows(
+  moments: FlaggedMoment[],
+  padSec: number,
+  videoDurationSec: number
+): Array<{ start: number; end: number; moments: FlaggedMoment[] }> {
+  if (moments.length === 0) return [];
+  const sorted = [...moments].sort((a, b) => a.flagged_sec - b.flagged_sec);
+  const windows: Array<{ start: number; end: number; moments: FlaggedMoment[] }> = [];
+  for (const m of sorted) {
+    const s = Math.max(0, m.flagged_sec - padSec);
+    const e = Math.min(videoDurationSec, m.flagged_sec + padSec);
+    const last = windows[windows.length - 1];
+    if (last && s <= last.end) {
+      last.end = Math.max(last.end, e);
+      last.moments.push(m);
+    } else {
+      windows.push({ start: s, end: e, moments: [m] });
+    }
+  }
+  return windows;
+}
+
+// Step 2: YOLO Detection — send flagged segments to YOLO backend for object annotation
+interface YoloDetection {
+  frame_sec: number;
+  annotated_frame_b64: string;
+  objects: Array<{ label: string; confidence: number; bbox: number[] }>;
+}
+
+async function yoloDetectSegment(
+  videoFile: File,
+  startSec: number,
+  endSec: number,
+  yoloFps: number,
+  onLog: (msg: string) => void
+): Promise<YoloDetection[]> {
+  onLog(`🔧 YOLO scanning segment ${startSec}s - ${endSec}s at ${yoloFps} FPS...`);
+
+  const formData = new FormData();
+  formData.append('file', videoFile);
+  formData.append('start_sec', startSec.toString());
+  formData.append('end_sec', endSec.toString());
+  formData.append('yolo_fps', yoloFps.toString());
+  formData.append('classes', 'car,truck,motorcycle,person,bicycle,bus');
+
+  const res = await fetch('http://localhost:8000/yolo_detect', {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!res.ok) {
+    throw new Error(`YOLO detect failed: ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  const detections: YoloDetection[] = data.detections || [];
+  const totalObjects = detections.reduce((sum: number, d: YoloDetection) => sum + d.objects.length, 0);
+  onLog(`   ✅ YOLO found ${totalObjects} objects across ${detections.length} frames.`);
+
+  return detections;
+}
+
+// Step 3: Gemini Final Reasoning — send ALL annotated frames + bbox metadata for the whole window
+async function geminiFinalReasoning(
+  apiKey: string,
+  query: string,
+  windowStart: number,
+  windowEnd: number,
+  flaggedMoments: FlaggedMoment[],
+  detections: YoloDetection[],
+  onLog: (msg: string) => void
+): Promise<Keyframe[]> {
+  if (detections.length === 0) {
+    onLog(`   ⚠️ No frames returned from YOLO — skipping reasoning.`);
+    return [];
+  }
+
+  onLog(`🧠 Phase 3: Sending ${detections.length} annotated frames @ ${YOLO_WINDOW_FPS} FPS to Gemini...`);
+
+  const context = detections.map((d, i) => ({
+    frame_idx: i,
+    timestamp_sec: d.frame_sec,
+    detected_objects: d.objects.map((o, j) => ({
+      object_id: `f${i}_o${j}`,
+      label: o.label,
+      confidence: o.confidence,
+      bbox_1000: o.bbox,
+    }))
+  }));
+
+  const flaggedSummary = flaggedMoments
+    .map(m => `${m.flagged_sec.toFixed(1)}s ("${m.description}")`)
+    .join('; ');
+
+  const prompt = `You are a forensic video analyst.
+USER QUERY: "${query}"
+COARSE SCREEN flagged these moments inside this window: ${flaggedSummary}
+
+I am showing you ${detections.length} sequential frames sampled at ${YOLO_WINDOW_FPS} FPS spanning ${windowStart.toFixed(1)}s..${windowEnd.toFixed(1)}s of the original video.
+Each frame has YOLO detection boxes drawn (green rectangles with labels). Use the metadata below to refer to specific objects by object_id. Coordinates are normalized 0–1000 as [ymin, xmin, ymax, xmax].
+
+DETECTIONS:
+${JSON.stringify(context)}
+
+Reason about object motion, trajectories, and spatial relationships across the frames. Determine:
+1. Whether a real incident matching the query actually occurred.
+2. The single most representative INCIDENT frame (peak of the event).
+3. What kind of event happened (collision, near-miss, fall, debris, intrusion, etc.).
+4. Which detected objects are involved and the role of each.
+
+Return ONLY a JSON object with this EXACT shape:
+{
+  "incident_detected": boolean,
+  "incident_frame_idx": number,
+  "incident_timestamp_sec": number,
+  "event_type": string,
+  "description": string,
+  "severity": "low" | "medium" | "high",
+  "confidence": number,
+  "involved_objects": [
+    { "object_id": string, "role": string }
+  ]
+}
+
+If no real incident is confirmed, set "incident_detected": false and return defaults for the other fields.`;
+
+  const parts: any[] = [{ text: prompt }];
+  for (const d of detections) {
+    parts.push({
+      inlineData: { mimeType: "image/jpeg", data: d.annotated_frame_b64 }
+    });
+  }
+
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      contents: [{
-        parts: [
-          { text: systemPrompt },
-          { fileData: { fileUri: fileUri, mimeType: fileInfo.file.mimeType } }
-        ]
-      }],
-      generationConfig: {
-        responseMimeType: "application/json",
-        temperature: 0.2
-      }
+      contents: [{ parts }],
+      generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
     })
   });
 
-  if (!genRes.ok) {
-    throw new Error(`Analysis failed: ${await genRes.text()}`);
+  if (!res.ok) {
+    throw new Error(`Gemini reasoning failed: ${await res.text()}`);
   }
 
-  const genData = await genRes.json();
-  const text = genData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-  const detections = JSON.parse(text) as Array<{ start_time_seconds: number; end_time_seconds: number; is_verified: boolean; reasoning: string; feedback?: string; bounding_box_2d: [number, number, number, number] | null; confidence?: number }>;
-
-  // Log feedback for unverified events to help the user understand why it failed
-  const unverified = detections.find(d => d.is_verified === false);
-  if (unverified) {
-    onLog(`💡 Model Feedback: ${unverified.feedback || unverified.reasoning}`);
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  let parsed: any = {};
+  try { parsed = JSON.parse(text); } catch {
+    onLog(`   ⚠️ Reasoning returned invalid JSON.`);
+    return [];
   }
 
-  const verifiedDetections = detections.filter(d => d.is_verified !== false);
+  if (!parsed.incident_detected) {
+    onLog(`   ℹ️ No incident confirmed in window ${windowStart.toFixed(1)}-${windowEnd.toFixed(1)}s.`);
+    return [];
+  }
 
-  return verifiedDetections.map((d, i) => {
-    const start = d.start_time_seconds || 0;
-    const end = d.end_time_seconds || start + 1;
+  const idx = Math.max(0, Math.min(detections.length - 1, Number(parsed.incident_frame_idx ?? 0)));
+  const incidentFrame = detections[idx];
+  const incidentSec = Number(parsed.incident_timestamp_sec ?? incidentFrame?.frame_sec ?? windowStart);
+  const eventType = String(parsed.event_type || 'event');
+  const description = String(parsed.description || query);
+  const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0.8));
+  const involved: Array<{ object_id: string; role: string }> = Array.isArray(parsed.involved_objects) ? parsed.involved_objects : [];
+
+  const dur: [number, number] = [
+    Math.max(0, incidentSec - 1.5),
+    incidentSec + 1.5
+  ];
+
+  // Render one keyframe per involved object so each gets its own bbox overlay; if none, render a single label-only keyframe
+  if (involved.length === 0) {
+    onLog(`   ✅ Incident @ ${incidentSec.toFixed(1)}s: ${eventType} (${(confidence * 100).toFixed(0)}%) — ${description}`);
+    return [{
+      id: ++keyframeIdCounter,
+      timeSeconds: incidentSec,
+      duration: dur,
+      boundingBox: null,
+      label: `${eventType} — ${description}`,
+      confidence,
+      color: KEYFRAME_COLORS[keyframeIdCounter % KEYFRAME_COLORS.length],
+    }];
+  }
+
+  const keyframes: Keyframe[] = involved.map((inv, i) => {
+    const m = /^f(\d+)_o(\d+)$/.exec(inv.object_id || '');
+    let bbox: [number, number, number, number] | null = null;
+    if (m) {
+      const fIdx = Number(m[1]);
+      const oIdx = Number(m[2]);
+      const det = detections[fIdx];
+      const obj = det?.objects[oIdx];
+      if (obj && Array.isArray(obj.bbox) && obj.bbox.length === 4) {
+        bbox = [obj.bbox[0], obj.bbox[1], obj.bbox[2], obj.bbox[3]];
+      }
+    }
     return {
       id: ++keyframeIdCounter,
-      timeSeconds: start,
-      duration: [start, Math.max(start, end)],
-      boundingBox: d.bounding_box_2d || null,
-      label: d.reasoning || query,
-      confidence: d.confidence || 0.95, // Fallback if confidence isn't strictly requested
+      timeSeconds: incidentSec,
+      duration: dur,
+      boundingBox: bbox,
+      label: `${inv.role || 'object'} — ${eventType}`,
+      confidence,
       color: KEYFRAME_COLORS[i % KEYFRAME_COLORS.length],
     };
   });
+
+  onLog(`   ✅ Incident @ ${incidentSec.toFixed(1)}s: ${eventType} (${(confidence * 100).toFixed(0)}%) — ${description}`);
+  onLog(`      Involved: ${involved.map(o => `${o.role}`).join(', ')}`);
+  return keyframes;
 }
+
+// ===== PIPELINE MEMOIZATION LOGIC IS NOW IN APP COMPONENT =====
+
+
 
 // ===== SVG ICONS =====
 const IconTerminal = () => (
@@ -274,12 +605,41 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [queryHistory, setQueryHistory] = useState<string[]>([]);
+  const [yoloFps, setYoloFps] = useState<number>(5);
+  const [scanStart, setScanStart] = useState<number>(0);
+  const [scanEnd, setScanEnd] = useState<number>(0);
 
   // Gemini API key management
   const [geminiApiKey, setGeminiApiKey] = useState<string>(ENV_API_KEY || '');
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [isLogExpanded, setIsLogExpanded] = useState(false);
+  const [backendStatus, setBackendStatus] = useState<'checking' | 'online' | 'offline'>('checking');
+
+  // Pipeline Memoization State
+  const [pipelineOptimizedFile, setPipelineOptimizedFile] = useState<File | null>(null);
+  const [pipelineGeminiUri, setPipelineGeminiUri] = useState<{ fileUri: string, mimeType: string } | null>(null);
+  const [pipelineScreenedSegments, setPipelineScreenedSegments] = useState<any[] | null>(null);
+  const lastQueryRef = useRef<string>('');
+
+  // Check backend health
+  useEffect(() => {
+    const checkBackend = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/health');
+        if (res.ok) {
+          setBackendStatus('online');
+        } else {
+          setBackendStatus('offline');
+        }
+      } catch (e) {
+        setBackendStatus('offline');
+      }
+    };
+    checkBackend();
+    const interval = setInterval(checkBackend, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Check for API key on mount
   useEffect(() => {
@@ -324,6 +684,10 @@ export default function App() {
     setVideoUrl(url);
     setKeyframes([]);
     setActiveKeyframe(null);
+    setPipelineOptimizedFile(null);
+    setPipelineGeminiUri(null);
+    setPipelineScreenedSegments(null);
+    lastQueryRef.current = '';
     addLog('success', `Video loaded: ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)`);
   }, [addLog]);
 
@@ -333,9 +697,11 @@ export default function App() {
 
   const handleVideoMetadata = useCallback(() => {
     if (videoRef.current) {
-      setVideoDuration(videoRef.current.duration);
+      const dur = videoRef.current.duration;
+      setVideoDuration(dur);
+      setScanEnd(Math.floor(dur));
       setVideoDim({ w: videoRef.current.videoWidth, h: videoRef.current.videoHeight });
-      addLog('info', `Video duration: ${formatVideoTime(videoRef.current.duration)}, resolution: ${videoRef.current.videoWidth}x${videoRef.current.videoHeight}`);
+      addLog('info', `Video duration: ${formatVideoTime(dur)}, resolution: ${videoRef.current.videoWidth}x${videoRef.current.videoHeight}`);
     }
   }, [addLog]);
 
@@ -413,14 +779,93 @@ export default function App() {
     addLog('info', `🧠 Sending query to Gemini: "${queryText}"`);
 
     try {
-      addLog('info', `Starting analysis using Gemini File API...`);
-      const results = await uploadAndAnalyzeVideo(geminiApiKey, videoFile, queryText, (msg) => {
-        addLog('info', msg);
-      });
+      addLog('info', `🚀 Initializing Chunked Multi-Phase Pipeline...`);
+      addLog('info', `📊 Phase 1: Gemini batch screen (${BATCH_SIZE_SEC}s chunks) → Phase 2: YOLO @ ${YOLO_WINDOW_FPS} FPS over ±${PADDING_SEC}s windows → Phase 3: Gemini reasoning over annotated frames`);
+
+      // Step 0: Compress (one-shot, memoized for the session)
+      let currentOptFile = pipelineOptimizedFile;
+      if (!currentOptFile) {
+        currentOptFile = await compressVideoClientSide(videoFile, msg => addLog('info', msg));
+        setPipelineOptimizedFile(currentOptFile);
+      } else {
+        addLog('info', `⏭️ Skip: Already compressed video.`);
+      }
+
+      // Step 1a: Upload to Gemini File API (one-shot, memoized)
+      let currentGeminiUri = pipelineGeminiUri;
+      if (!currentGeminiUri) {
+        const fileInfo = await uploadVideoToGemini(geminiApiKey, currentOptFile, msg => addLog('info', msg));
+        currentGeminiUri = { fileUri: fileInfo.fileUri, mimeType: fileInfo.mimeType };
+        setPipelineGeminiUri(currentGeminiUri);
+      } else {
+        addLog('info', `⏭️ Skip: Video already ACTIVE on Gemini servers.`);
+      }
+
+      // Step 1b: Phase 1 — Batch screen via videoMetadata (no re-upload, isolated context per chunk)
+      let currentMoments: FlaggedMoment[] | null = pipelineScreenedSegments as FlaggedMoment[] | null;
+      if (!currentMoments || lastQueryRef.current !== queryText) {
+        currentMoments = await geminiBatchScreen(
+          geminiApiKey,
+          currentGeminiUri.fileUri,
+          currentGeminiUri.mimeType,
+          queryText,
+          videoDuration,
+          scanStart,
+          scanEnd,
+          msg => addLog('info', msg)
+        );
+        setPipelineScreenedSegments(currentMoments);
+        lastQueryRef.current = queryText;
+      } else {
+        addLog('info', `⏭️ Skip: Already screened for this query.`);
+      }
+
+      const filteredMoments = (currentMoments || []).filter(m =>
+        m.flagged_sec >= scanStart && m.flagged_sec <= (scanEnd > 0 ? scanEnd : videoDuration)
+      );
+
+      if (filteredMoments.length === 0) {
+        addLog('warn', `No moments flagged for "${queryText}" within the scan range.`);
+        setAnalyzing(false);
+        return;
+      }
+
+      // Step 2: Build merged ±5s windows (overlap-safe so YOLO doesn't re-run on the same frames)
+      const windows = buildMergedWindows(filteredMoments, PADDING_SEC, videoDuration);
+      addLog('info', `\n📌 Phase 2: ${windows.length} merged window(s) (${PADDING_SEC}s padding, deduped) for YOLO annotation.`);
+
+      const allKeyframes: Keyframe[] = [];
+      for (let i = 0; i < windows.length; i++) {
+        const w = windows[i];
+        addLog('info', `\n━━━ Window ${i + 1}/${windows.length}: ${w.start.toFixed(1)}s - ${w.end.toFixed(1)}s (${w.moments.length} flagged moment(s)) ━━━`);
+
+        // Phase 2: YOLO @ 3 FPS over the window — gives ~30 annotated frames for a 10s window
+        const detections = await yoloDetectSegment(videoFile, w.start, w.end, YOLO_WINDOW_FPS, msg => addLog('info', msg));
+
+        // Phase 3: Gemini reasoning over all annotated frames + bbox metadata
+        const kfs = await geminiFinalReasoning(
+          geminiApiKey,
+          queryText,
+          w.start,
+          w.end,
+          w.moments,
+          detections,
+          msg => addLog('info', msg)
+        );
+
+        allKeyframes.push(...kfs);
+
+        if (kfs.length > 0) {
+          addLog('success', `   🚨 Incident confirmed in window ${i + 1}.`);
+        }
+      }
+
+      addLog('info', `\n✅ Pipeline complete. ${allKeyframes.length} keyframe(s) rendered.`);
+      const results = allKeyframes;
 
       // Step 3: Process results
       if (results.length === 0) {
-        addLog('warn', `No matches found for "${queryText}".`);
+        addLog('warn', `No matches confirmed for "${queryText}" after verification.`);
       } else {
         setKeyframes(results.sort((a, b) => a.timeSeconds - b.timeSeconds));
         results.forEach(kf => {
@@ -435,15 +880,16 @@ export default function App() {
       }
     } catch (err: any) {
       console.error('[Scamtir] Gemini API error:', err);
-      addLog('error', `Gemini API error: ${err.message}`);
-      if (err.message.includes('401') || err.message.includes('403')) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      addLog('error', `API error: ${errMsg}`);
+      if (errMsg.includes('401') || errMsg.includes('403')) {
         addLog('error', 'Invalid API key. Please re-enter your Gemini API key.');
         setShowApiKeyModal(true);
       }
     } finally {
       setAnalyzing(false);
     }
-  }, [query, videoUrl, analyzing, videoDuration, addLog, queryHistory, jumpToKeyframe, geminiApiKey]);
+  }, [query, videoUrl, analyzing, videoDuration, addLog, queryHistory, jumpToKeyframe, geminiApiKey, pipelineOptimizedFile, pipelineGeminiUri, pipelineScreenedSegments, videoFile, scanStart, scanEnd]);
 
   const loadPreset = useCallback((preset: PresetQuery) => {
     setQuery(preset.query);
@@ -478,6 +924,10 @@ export default function App() {
           </div>
           <div className="viewport-status">
             <div className="status-indicator">
+              <div className={`status-dot ${backendStatus === 'online' ? '' : 'inactive'}`} style={backendStatus === 'offline' ? { background: '#f87171' } : {}} />
+              <span>YOLO: {backendStatus === 'online' ? 'Online' : backendStatus === 'offline' ? 'Offline' : 'Checking...'}</span>
+            </div>
+            <div className="status-indicator" style={{ marginLeft: 12 }}>
               <div className={`status-dot ${videoUrl ? '' : 'inactive'}`} />
               <span>{videoUrl ? (isPlaying ? 'Playing' : 'Loaded') : 'No Video'}</span>
             </div>
@@ -725,25 +1175,85 @@ export default function App() {
               </button>
             </div>
 
-            {/* Run button */}
-            <button
-              className={`run-detection-btn gemini-btn ${analyzing ? 'detecting' : ''}`}
-              onClick={runAnalysis}
-              disabled={analyzing}
-            >
-              {analyzing ? (
-                <>
-                  <div className="spinner" />
-                  Analyzing with Gemini...
-                </>
-              ) : (
-                <>
-                  <IconGemini />
-                  Analyze Video
-                </>
-              )}
-            </button>
+            {/* Pipeline Configuration */}
+            <div style={{ marginTop: '16px', marginBottom: '20px', background: 'rgba(255,255,255,0.03)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
+
+              <div style={{ fontSize: '11px', color: '#666', marginBottom: '12px', textTransform: 'uppercase', letterSpacing: '1px' }}>
+                Pipeline Configuration
+              </div>
+
+              {/* Row 1: Target Range */}
+              <div style={{ display: 'flex', gap: '16px', marginBottom: '16px' }}>
+                <div style={{ flex: 1 }}>
+                  <label style={{ fontSize: '12px', color: '#888', marginBottom: '4px', display: 'block' }}>
+                    Scan Start (sec)
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    max={Math.max(0, scanEnd - 1)}
+                    value={scanStart}
+                    onChange={e => setScanStart(parseInt(e.target.value) || 0)}
+                    className="query-input"
+                    style={{ width: '100%', padding: '8px', marginBottom: '4px' }}
+                  />
+                  <div style={{ fontSize: '10px', color: '#555' }}>Start time limit</div>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={{ fontSize: '12px', color: '#888', marginBottom: '4px', display: 'block' }}>
+                    Scan End (sec)
+                  </label>
+                  <input
+                    type="number"
+                    min={scanStart + 1}
+                    max={Math.floor(videoDuration) || 9999}
+                    value={scanEnd}
+                    onChange={e => setScanEnd(parseInt(e.target.value) || 0)}
+                    className="query-input"
+                    style={{ width: '100%', padding: '8px', marginBottom: '4px' }}
+                  />
+                  <div style={{ fontSize: '10px', color: '#555' }}>End time limit</div>
+                </div>
+              </div>
+
+              {/* Row 2: Advanced Settings */}
+              <div>
+                <label style={{ fontSize: '12px', color: '#888', marginBottom: '8px', display: 'flex', justifyContent: 'space-between' }}>
+                  <span>YOLO Annotator Precision</span>
+                  <span style={{ color: '#fff', fontWeight: 'bold' }}>{yoloFps} FPS</span>
+                </label>
+                <input
+                  type="range"
+                  min="1"
+                  max="30"
+                  value={yoloFps}
+                  onChange={e => setYoloFps(parseInt(e.target.value) || 5)}
+                  style={{ width: '100%', cursor: 'pointer', marginBottom: '4px' }}
+                />
+                <div style={{ fontSize: '10px', color: '#555' }}>Higher FPS = Better spatial reasoning, but slower processing.</div>
+              </div>
+            </div>
           </div>
+
+          {/* Run button */}
+          <button
+            className={`run-detection-btn gemini-btn ${analyzing ? 'detecting' : ''}`}
+            onClick={runAnalysis}
+            disabled={analyzing}
+          >
+            {analyzing ? (
+              <>
+                <div className="spinner" />
+                Running Pipeline...
+              </>
+            ) : (
+              <>
+                <IconGemini />
+                Start Gemini-Optimized Pipeline
+
+              </>
+            )}
+          </button>
 
           {/* Query History */}
           {queryHistory.length > 0 && (

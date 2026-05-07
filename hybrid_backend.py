@@ -12,6 +12,7 @@ from fastapi.background import BackgroundTasks
 import uvicorn
 import threading
 from ultralytics import YOLOWorld
+from tqdm import tqdm
 
 app = FastAPI(title="Scamtir Hybrid Video Backend (YOLO + Gemini)")
 
@@ -24,12 +25,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "message": "YOLO Backend is running"}
+
 # Thread lock for YOLO model
 model_lock = threading.Lock()
 
 print("[BACKEND] Loading YOLO-World model...")
 model = YOLOWorld("yolov8s-worldv2.pt")
 print("[BACKEND] ✅ YOLO-World loaded.")
+
+# Cache the last class string so we skip the CLIP text-encode pass on repeated calls
+_last_class_key = None
+
+def set_classes_cached(class_list):
+    global _last_class_key
+    key = "|".join(class_list)
+    if key != _last_class_key:
+        model.set_classes(class_list)
+        _last_class_key = key
 
 def cleanup_file(path: str):
     try:
@@ -45,7 +60,9 @@ async def hybrid_trigger(
     query: str = Form(...),
     yolo_fps: int = Form(5),
     clip_duration_sec: int = Form(4),
-    confidence_threshold: float = Form(0.1)
+    confidence_threshold: float = Form(0.1),
+    start_sec: float = Form(0.0),
+    end_sec: float = Form(-1.0)
 ):
     """
     1. Receives video.
@@ -84,30 +101,41 @@ async def hybrid_trigger(
     detection_bbox = None
     
     with model_lock:
-        model.set_classes([query])
+        set_classes_cached([query])
+
+        start_frame = int(start_sec * orig_fps)
+        end_frame = int(end_sec * orig_fps) if end_sec > 0 else total_frames
         
-        current_frame = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-                
-            # Only process at the target YOLO FPS
-            if current_frame % frame_skip == 0:
-                results = model.predict(frame, conf=confidence_threshold, verbose=False)
-                
-                if len(results) > 0 and len(results[0].boxes) > 0:
-                    # Anomaly found!
-                    box = results[0].boxes[0] # Take highest confidence
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
-                    conf = box.conf[0].item()
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        current_frame = start_frame
+        scan_frames = min(total_frames, end_frame) - start_frame
+
+        with tqdm(total=scan_frames, desc=f"Scanning '{query}'", unit="frame") as pbar:
+            while True:
+                if current_frame > end_frame:
+                    break
                     
-                    detection_timestamp = current_frame / orig_fps
-                    detection_bbox = [y1/height*1000, x1/width*1000, y2/height*1000, x2/width*1000]
-                    print(f"[HYBRID] 🚨 Anomaly detected at {detection_timestamp:.2f}s (Conf: {conf:.2f})")
-                    break # Stop scanning, we found the trigger point
-            
-            current_frame += 1
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                # Only process at the target YOLO FPS
+                if current_frame % frame_skip == 0:
+                    results = model.predict(frame, conf=confidence_threshold, verbose=False)
+                    
+                    if len(results) > 0 and len(results[0].boxes) > 0:
+                        # Anomaly found!
+                        box = results[0].boxes[0] # Take highest confidence
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
+                        conf = box.conf[0].item()
+                        
+                        detection_timestamp = current_frame / orig_fps
+                        detection_bbox = [y1/height*1000, x1/width*1000, y2/height*1000, x2/width*1000]
+                        print(f"\n[HYBRID] 🚨 Anomaly detected at {detection_timestamp:.2f}s (Conf: {conf:.2f})")
+                        break # Stop scanning, we found the trigger point
+                
+                current_frame += 1
+                pbar.update(1)
 
     # If nothing detected
     if detection_timestamp == -1:
@@ -163,6 +191,124 @@ async def hybrid_trigger(
         }
     )
 
+@app.post("/yolo_detect")
+async def yolo_detect(
+    file: UploadFile = File(...),
+    start_sec: float = Form(0.0),
+    end_sec: float = Form(10.0),
+    yolo_fps: int = Form(3),
+    classes: str = Form("car,truck,motorcycle,person,bicycle,bus"),
+    confidence_threshold: float = Form(0.15)
+):
+    """
+    Phase 2 of pipeline. Given a 10s window flagged by Gemini, samples it at `yolo_fps`
+    (default 3) and returns annotated frames (base64 JPEG) + bbox metadata so Gemini
+    can do final reasoning.
+
+    Uses cap.grab() for skipped frames to avoid wasted decode work.
+    """
+    import base64
+
+    class_list = [c.strip() for c in classes.split(",") if c.strip()]
+    print(f"\n[YOLO_DETECT] Received video: {file.filename}")
+    print(f"[YOLO_DETECT] Range: {start_sec:.1f}s - {end_sec:.1f}s | Classes: {class_list} | FPS: {yolo_fps}")
+
+    temp_dir = tempfile.gettempdir()
+    video_id = str(uuid.uuid4())
+    input_path = os.path.join(temp_dir, f"{video_id}_detect.mp4")
+
+    with open(input_path, "wb") as f:
+        f.write(await file.read())
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        cleanup_file(input_path)
+        return JSONResponse({"status": "error", "message": "Could not open video."}, status_code=400)
+
+    orig_fps = cap.get(cv2.CAP_PROP_FPS)
+    if orig_fps <= 0: orig_fps = 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    s_frame = int(start_sec * orig_fps)
+    e_frame = min(int(end_sec * orig_fps), total_frames)
+    frame_skip = max(1, int(round(orig_fps / max(1, yolo_fps))))
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, s_frame)
+
+    detections = []
+
+    with model_lock:
+        set_classes_cached(class_list)
+        scan_total = max(0, e_frame - s_frame)
+
+        with tqdm(total=scan_total, desc=f"YOLO detecting [{start_sec:.0f}s-{end_sec:.0f}s]", unit="frame") as pbar:
+            current_frame = s_frame
+            while current_frame < e_frame:
+                # Only fully decode the frames we'll actually run YOLO on; grab() the rest (skip-decode optimization)
+                if (current_frame - s_frame) % frame_skip == 0:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    results = model.predict(frame, conf=confidence_threshold, verbose=False)
+
+                    frame_objects = []
+                    annotated_frame = frame.copy()
+
+                    if len(results) > 0 and len(results[0].boxes) > 0:
+                        for box in results[0].boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
+                            conf = box.conf[0].item()
+                            cls_id = int(box.cls[0].item())
+                            label = class_list[cls_id] if cls_id < len(class_list) else f"class_{cls_id}"
+
+                            color = (0, 255, 0)
+                            cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                            cv2.putText(annotated_frame, f"{label} {conf:.2f}",
+                                        (int(x1), int(y1) - 8),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                            frame_objects.append({
+                                "label": label,
+                                "confidence": round(conf, 3),
+                                "bbox": [
+                                    round(y1 / height * 1000),
+                                    round(x1 / width * 1000),
+                                    round(y2 / height * 1000),
+                                    round(x2 / width * 1000)
+                                ]
+                            })
+
+                    _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    b64_frame = base64.b64encode(buffer).decode('utf-8')
+
+                    frame_sec = round(current_frame / orig_fps, 2)
+                    detections.append({
+                        "frame_sec": frame_sec,
+                        "annotated_frame_b64": b64_frame,
+                        "objects": frame_objects
+                    })
+                else:
+                    if not cap.grab():
+                        break
+
+                current_frame += 1
+                pbar.update(1)
+
+    cap.release()
+    cleanup_file(input_path)
+
+    print(f"[YOLO_DETECT] ✅ Done. {len(detections)} frames processed, "
+          f"{sum(len(d['objects']) for d in detections)} total objects detected.")
+
+    return JSONResponse({
+        "status": "ok",
+        "segment": {"start_sec": start_sec, "end_sec": end_sec},
+        "detections": detections
+    })
+
 if __name__ == "__main__":
     print("[HYBRID] 🚀 Starting Hybrid YOLO Backend on http://0.0.0.0:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("hybrid_backend:app", host="0.0.0.0", port=8000)
