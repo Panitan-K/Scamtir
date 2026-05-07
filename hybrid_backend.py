@@ -12,6 +12,7 @@ from fastapi.background import BackgroundTasks
 import uvicorn
 import threading
 from ultralytics import YOLOWorld
+from tqdm import tqdm
 
 app = FastAPI(title="Scamtir Hybrid Video Backend (YOLO + Gemini)")
 
@@ -23,6 +24,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "message": "YOLO Backend is running"}
 
 # Thread lock for YOLO model
 model_lock = threading.Lock()
@@ -45,7 +50,9 @@ async def hybrid_trigger(
     query: str = Form(...),
     yolo_fps: int = Form(5),
     clip_duration_sec: int = Form(4),
-    confidence_threshold: float = Form(0.1)
+    confidence_threshold: float = Form(0.1),
+    start_sec: float = Form(0.0),
+    end_sec: float = Form(-1.0)
 ):
     """
     1. Receives video.
@@ -86,28 +93,39 @@ async def hybrid_trigger(
     with model_lock:
         model.set_classes([query])
         
-        current_frame = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-                
-            # Only process at the target YOLO FPS
-            if current_frame % frame_skip == 0:
-                results = model.predict(frame, conf=confidence_threshold, verbose=False)
-                
-                if len(results) > 0 and len(results[0].boxes) > 0:
-                    # Anomaly found!
-                    box = results[0].boxes[0] # Take highest confidence
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
-                    conf = box.conf[0].item()
+        start_frame = int(start_sec * orig_fps)
+        end_frame = int(end_sec * orig_fps) if end_sec > 0 else total_frames
+        
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        current_frame = start_frame
+        scan_frames = min(total_frames, end_frame) - start_frame
+
+        with tqdm(total=scan_frames, desc=f"Scanning '{query}'", unit="frame") as pbar:
+            while True:
+                if current_frame > end_frame:
+                    break
                     
-                    detection_timestamp = current_frame / orig_fps
-                    detection_bbox = [y1/height*1000, x1/width*1000, y2/height*1000, x2/width*1000]
-                    print(f"[HYBRID] 🚨 Anomaly detected at {detection_timestamp:.2f}s (Conf: {conf:.2f})")
-                    break # Stop scanning, we found the trigger point
-            
-            current_frame += 1
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                # Only process at the target YOLO FPS
+                if current_frame % frame_skip == 0:
+                    results = model.predict(frame, conf=confidence_threshold, verbose=False)
+                    
+                    if len(results) > 0 and len(results[0].boxes) > 0:
+                        # Anomaly found!
+                        box = results[0].boxes[0] # Take highest confidence
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
+                        conf = box.conf[0].item()
+                        
+                        detection_timestamp = current_frame / orig_fps
+                        detection_bbox = [y1/height*1000, x1/width*1000, y2/height*1000, x2/width*1000]
+                        print(f"\n[HYBRID] 🚨 Anomaly detected at {detection_timestamp:.2f}s (Conf: {conf:.2f})")
+                        break # Stop scanning, we found the trigger point
+                
+                current_frame += 1
+                pbar.update(1)
 
     # If nothing detected
     if detection_timestamp == -1:
@@ -164,5 +182,7 @@ async def hybrid_trigger(
     )
 
 if __name__ == "__main__":
-    print("[HYBRID] 🚀 Starting Hybrid YOLO Backend on http://0.0.0.0:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import multiprocessing
+    workers = max(1, multiprocessing.cpu_count() - 3) # Use most of available CPU cores
+    print(f"[HYBRID] 🚀 Starting Hybrid YOLO Backend on http://0.0.0.0:8000 with {workers} workers")
+    uvicorn.run("hybrid_backend:app", host="0.0.0.0", port=8000, workers=workers)

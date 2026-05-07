@@ -3,6 +3,7 @@ import './App.css';
 
 const ENV_API_KEY = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined)?.trim();
 const GEMINI_MODEL = 'gemini-3-flash-preview';
+const HYBRID_BACKEND_URL = 'http://localhost:8000/hybrid_trigger';
 
 // ===== TYPES =====
 interface LogEntry {
@@ -167,17 +168,23 @@ If nothing matches, return [].`;
 
   const genData = await genRes.json();
   const text = genData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-  const detections = JSON.parse(text) as Array<{ start_time_seconds: number; end_time_seconds: number; is_verified: boolean; reasoning: string; feedback?: string; bounding_box_2d: [number, number, number, number] | null; confidence?: number }>;
+  let detections = [];
+  try {
+    detections = JSON.parse(text);
+  } catch (e) {
+    console.error("Failed to parse Gemini JSON:", text);
+    throw new Error("Gemini returned invalid JSON.");
+  }
 
   // Log feedback for unverified events to help the user understand why it failed
-  const unverified = detections.find(d => d.is_verified === false);
+  const unverified = detections.find((d: any) => d.is_verified === false);
   if (unverified) {
     onLog(`💡 Model Feedback: ${unverified.feedback || unverified.reasoning}`);
   }
 
-  const verifiedDetections = detections.filter(d => d.is_verified !== false);
+  const verifiedDetections = detections.filter((d: any) => d.is_verified !== false);
 
-  return verifiedDetections.map((d, i) => {
+  return verifiedDetections.map((d: any, i: number) => {
     const start = d.start_time_seconds || 0;
     const end = d.end_time_seconds || start + 1;
     return {
@@ -186,10 +193,83 @@ If nothing matches, return [].`;
       duration: [start, Math.max(start, end)],
       boundingBox: d.bounding_box_2d || null,
       label: d.reasoning || query,
-      confidence: d.confidence || 0.95, // Fallback if confidence isn't strictly requested
+      confidence: d.confidence || 0.95, 
       color: KEYFRAME_COLORS[i % KEYFRAME_COLORS.length],
     };
   });
+}
+
+// ===== HYBRID LOGIC =====
+async function runHybridAnalysis(
+  apiKey: string, 
+  videoFile: File, 
+  query: string,
+  yoloFps: number,
+  clipDuration: number,
+  scanStart: number,
+  scanEnd: number,
+  onLog: (msg: string) => void
+): Promise<Keyframe[]> {
+  onLog(`🚀 Initializing Hybrid Pipeline...`);
+  onLog(`🔍 Step 1: Scanning video with YOLO-World at ${HYBRID_BACKEND_URL}`);
+
+  const formData = new FormData();
+  formData.append('file', videoFile);
+  formData.append('query', query);
+  formData.append('yolo_fps', yoloFps.toString());
+  formData.append('clip_duration_sec', clipDuration.toString());
+  formData.append('start_sec', scanStart.toString());
+  formData.append('end_sec', scanEnd.toString());
+
+  const hybridRes = await fetch(HYBRID_BACKEND_URL, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!hybridRes.ok) {
+    const errorData = await hybridRes.json().catch(() => ({ message: 'Unknown error' }));
+    if (hybridRes.status === 404 || errorData.status === 'not_found') {
+      onLog(`❌ YOLO-World: No matches found for "${query}". Skipping Gemini.`);
+      return [];
+    }
+    throw new Error(`Hybrid Backend failed: ${errorData.message || hybridRes.statusText}`);
+  }
+
+  // Check if it's a JSON response (not_found) or a File response (video)
+  const contentType = hybridRes.headers.get('content-type');
+  if (contentType?.includes('application/json')) {
+    const data = await hybridRes.json();
+    if (data.status === 'not_found') {
+      onLog(`❌ YOLO-World: No matches found. Pipeline halted.`);
+      return [];
+    }
+  }
+
+  // We got a video clip!
+  const blob = await hybridRes.blob();
+  const detectionTime = parseFloat(hybridRes.headers.get('X-Detection-Time') || '0');
+  const detectionBbox = JSON.parse(hybridRes.headers.get('X-Bounding-Box') || 'null');
+  
+  onLog(`✅ YOLO-World triggered at ${detectionTime.toFixed(2)}s. Created micro-chunk.`);
+  onLog(`🧠 Step 2: Sending 4s micro-chunk to Gemini for reasoning...`);
+
+  // Create a file object for Gemini
+  const microChunkFile = new File([blob], 'micro_chunk.mp4', { type: 'video/mp4' });
+
+  // Analyze the micro-chunk with Gemini
+  const results = await uploadAndAnalyzeVideo(apiKey, microChunkFile, query, (msg) => {
+    onLog(`[Gemini] ${msg}`);
+  });
+
+  // Offset the timestamps back to the original video time
+  // The backend slices 2s before and 2s after detection (total 4s)
+  const offset = Math.max(0, detectionTime - 2.0);
+  
+  return results.map(kf => ({
+    ...kf,
+    timeSeconds: kf.timeSeconds + offset,
+    duration: [kf.duration[0] + offset, kf.duration[1] + offset] as [number, number],
+  }));
 }
 
 // ===== SVG ICONS =====
@@ -274,12 +354,36 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [queryHistory, setQueryHistory] = useState<string[]>([]);
+  const [yoloFps, setYoloFps] = useState<number>(5);
+  const [clipDuration, setClipDuration] = useState<number>(4);
+  const [scanStart, setScanStart] = useState<number>(0);
+  const [scanEnd, setScanEnd] = useState<number>(0);
 
   // Gemini API key management
   const [geminiApiKey, setGeminiApiKey] = useState<string>(ENV_API_KEY || '');
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [isLogExpanded, setIsLogExpanded] = useState(false);
+  const [backendStatus, setBackendStatus] = useState<'checking' | 'online' | 'offline'>('checking');
+
+  // Check backend health
+  useEffect(() => {
+    const checkBackend = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/health');
+        if (res.ok) {
+          setBackendStatus('online');
+        } else {
+          setBackendStatus('offline');
+        }
+      } catch (e) {
+        setBackendStatus('offline');
+      }
+    };
+    checkBackend();
+    const interval = setInterval(checkBackend, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Check for API key on mount
   useEffect(() => {
@@ -333,9 +437,11 @@ export default function App() {
 
   const handleVideoMetadata = useCallback(() => {
     if (videoRef.current) {
-      setVideoDuration(videoRef.current.duration);
+      const dur = videoRef.current.duration;
+      setVideoDuration(dur);
+      setScanEnd(Math.floor(dur));
       setVideoDim({ w: videoRef.current.videoWidth, h: videoRef.current.videoHeight });
-      addLog('info', `Video duration: ${formatVideoTime(videoRef.current.duration)}, resolution: ${videoRef.current.videoWidth}x${videoRef.current.videoHeight}`);
+      addLog('info', `Video duration: ${formatVideoTime(dur)}, resolution: ${videoRef.current.videoWidth}x${videoRef.current.videoHeight}`);
     }
   }, [addLog]);
 
@@ -413,8 +519,8 @@ export default function App() {
     addLog('info', `🧠 Sending query to Gemini: "${queryText}"`);
 
     try {
-      addLog('info', `Starting analysis using Gemini File API...`);
-      const results = await uploadAndAnalyzeVideo(geminiApiKey, videoFile, queryText, (msg) => {
+      addLog('info', `Starting hybrid analysis (YOLO-World + Gemini)...`);
+      const results = await runHybridAnalysis(geminiApiKey, videoFile, queryText, yoloFps, clipDuration, scanStart, scanEnd, (msg) => {
         addLog('info', msg);
       });
 
@@ -478,6 +584,10 @@ export default function App() {
           </div>
           <div className="viewport-status">
             <div className="status-indicator">
+              <div className={`status-dot ${backendStatus === 'online' ? '' : 'inactive'}`} style={backendStatus === 'offline' ? {background: '#f87171'} : {}} />
+              <span>YOLO: {backendStatus === 'online' ? 'Online' : backendStatus === 'offline' ? 'Offline' : 'Checking...'}</span>
+            </div>
+            <div className="status-indicator" style={{ marginLeft: 12 }}>
               <div className={`status-dot ${videoUrl ? '' : 'inactive'}`} />
               <span>{videoUrl ? (isPlaying ? 'Playing' : 'Loaded') : 'No Video'}</span>
             </div>
@@ -725,7 +835,71 @@ export default function App() {
               </button>
             </div>
 
-            {/* Run button */}
+            {/* Hybrid Settings */}
+            <div style={{ marginTop: '16px', marginBottom: '20px', background: 'rgba(255,255,255,0.03)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
+              
+              {/* Row 1: Target Range */}
+              <div style={{ display: 'flex', gap: '16px', marginBottom: '16px' }}>
+                <div style={{ flex: 1 }}>
+                  <label style={{ fontSize: '12px', color: '#888', marginBottom: '4px', display: 'block' }}>Scan Start (sec)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    max={Math.max(0, scanEnd - 1)}
+                    value={scanStart}
+                    onChange={e => setScanStart(parseInt(e.target.value) || 0)}
+                    className="query-input"
+                    style={{ width: '100%', padding: '8px' }}
+                  />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={{ fontSize: '12px', color: '#888', marginBottom: '4px', display: 'block' }}>Scan End (sec)</label>
+                  <input
+                    type="number"
+                    min={scanStart + 1}
+                    max={Math.floor(videoDuration) || 9999}
+                    value={scanEnd}
+                    onChange={e => setScanEnd(parseInt(e.target.value) || 0)}
+                    className="query-input"
+                    style={{ width: '100%', padding: '8px' }}
+                  />
+                </div>
+              </div>
+
+              {/* Row 2: Advanced Settings */}
+              <div style={{ display: 'flex', gap: '16px' }}>
+                <div style={{ flex: 1 }}>
+                <label style={{ fontSize: '12px', color: '#888', marginBottom: '8px', display: 'flex', justifyContent: 'space-between' }}>
+                  <span>YOLO Scan FPS</span>
+                  <span style={{color: '#fff', fontWeight: 'bold'}}>{yoloFps} FPS</span>
+                </label>
+                <input
+                  type="range"
+                  min="1"
+                  max="30"
+                  value={yoloFps}
+                  onChange={e => setYoloFps(parseInt(e.target.value) || 5)}
+                  style={{ width: '100%', cursor: 'pointer' }}
+                />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={{ fontSize: '12px', color: '#888', marginBottom: '8px', display: 'flex', justifyContent: 'space-between' }}>
+                  <span>Clip Duration</span>
+                  <span style={{color: '#fff', fontWeight: 'bold'}}>{clipDuration} sec</span>
+                </label>
+                <input
+                  type="range"
+                  min="1"
+                  max="20"
+                  value={clipDuration}
+                  onChange={e => setClipDuration(parseInt(e.target.value) || 4)}
+                  style={{ width: '100%', cursor: 'pointer' }}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Run button */}
             <button
               className={`run-detection-btn gemini-btn ${analyzing ? 'detecting' : ''}`}
               onClick={runAnalysis}
