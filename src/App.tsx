@@ -202,63 +202,129 @@ async function uploadVideoToGemini(apiKey: string, videoFile: File, onLog: (msg:
   return { fileUri, mimeType: fileInfo.file.mimeType, fileName };
 }
 
-// Step 1: Gemini Screening — ask Gemini which time segments contain the incident
-async function geminiScreenVideo(
+// ===== PIPELINE CONSTANTS =====
+const BATCH_SIZE_SEC = 8;          // Phase 1: screening batch length (transformers handle short clips better)
+const PADDING_SEC = 5;             // Phase 2: ±5s window around each flagged second
+const SCREEN_CONCURRENCY = 4;      // Max parallel Gemini screening calls
+const YOLO_WINDOW_FPS = 3;         // Phase 2: 3 FPS × 10s = 30 annotated frames
+
+interface FlaggedMoment {
+  flagged_sec: number;
+  confidence: number;
+  description: string;
+}
+
+// Step 1: Gemini Batch Screening — chop video into <10s windows, ask each for the EXACT second of the event
+async function geminiBatchScreen(
   apiKey: string,
   fileUri: string,
   mimeType: string,
   query: string,
+  videoDurationSec: number,
+  scanStart: number,
+  scanEnd: number,
   onLog: (msg: string) => void
-): Promise<Array<{ batch_start_sec: number; batch_end_sec: number; confidence: number; description: string }>> {
-  onLog(`🔍 Step 1: Screening entire video for "${query}"...`);
+): Promise<FlaggedMoment[]> {
+  const start = Math.max(0, Math.floor(scanStart));
+  const end = Math.min(Math.ceil(scanEnd > 0 ? scanEnd : videoDurationSec), Math.ceil(videoDurationSec));
 
-  const screenPrompt = `You are a video screening engine for incident detection.
-Scan this entire video carefully and identify all time segments where this occurs: "${query}"
+  const batches: Array<{ start: number; end: number }> = [];
+  for (let s = start; s < end; s += BATCH_SIZE_SEC) {
+    const e = Math.min(s + BATCH_SIZE_SEC, end);
+    if (e - s >= 1) batches.push({ start: s, end: e });
+  }
+  onLog(`📦 Phase 1: Screening ${batches.length} batch(es) of ≤${BATCH_SIZE_SEC}s for "${query}"...`);
 
-Group your findings into segments of approximately 10 seconds each.
-Return ONLY a JSON array of objects with:
-- "batch_start_sec": number (start of the segment in seconds)
-- "batch_end_sec": number (end of the segment in seconds)
+  const screenPrompt = `You are a video screening engine.
+Watch this short clip carefully and identify the EXACT second(s) when this occurs: "${query}"
+
+Return ONLY a JSON array. Each item must have:
+- "flagged_sec": number (the precise second in the ORIGINAL full video where the event occurs — use the timestamps you observe in this clip)
 - "confidence": number between 0 and 1
-- "description": string (brief description of what you observed)
+- "description": string (one short sentence describing what you saw at that moment)
 
-If nothing matches, return [].
-Be thorough — scan the entire video. Do not miss any incidents.`;
+Be precise. Pick the single most representative second per event. If multiple distinct events happen, list each.
+If nothing in this clip matches, return [].`;
 
-  const genRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{
-        parts: [
-          { text: screenPrompt },
-          { fileData: { fileUri, mimeType } }
-        ]
-      }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
-    })
-  });
-
-  if (!genRes.ok) {
-    throw new Error(`Gemini screening failed: ${await genRes.text()}`);
+  async function screenOne(batch: { start: number; end: number }): Promise<FlaggedMoment[]> {
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              {
+                fileData: { fileUri, mimeType },
+                videoMetadata: {
+                  startOffset: `${batch.start}s`,
+                  endOffset: `${batch.end}s`
+                }
+              },
+              { text: screenPrompt }
+            ]
+          }],
+          generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
+        })
+      });
+      if (!res.ok) {
+        onLog(`   ⚠️ Batch ${batch.start}-${batch.end}s screen failed: ${res.status}`);
+        return [];
+      }
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+      const arr: any[] = JSON.parse(text);
+      const moments = arr
+        .filter(x => typeof x.flagged_sec === 'number')
+        .map(x => ({
+          flagged_sec: Math.max(batch.start, Math.min(batch.end, Number(x.flagged_sec))),
+          confidence: Math.max(0, Math.min(1, Number(x.confidence) || 0.5)),
+          description: String(x.description || query),
+        }));
+      if (moments.length > 0) {
+        onLog(`   📍 Batch ${batch.start}-${batch.end}s: ${moments.length} moment(s) flagged.`);
+      }
+      return moments;
+    } catch (err) {
+      onLog(`   ⚠️ Batch ${batch.start}-${batch.end}s exception: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
   }
 
-  const genData = await genRes.json();
-  const text = genData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-  let segments = [];
-  try {
-    segments = JSON.parse(text);
-  } catch {
-    console.error("Failed to parse Gemini screening JSON:", text);
-    throw new Error("Gemini returned invalid JSON during screening.");
+  const results: FlaggedMoment[] = [];
+  for (let i = 0; i < batches.length; i += SCREEN_CONCURRENCY) {
+    const slice = batches.slice(i, i + SCREEN_CONCURRENCY);
+    const out = await Promise.all(slice.map(screenOne));
+    out.forEach(m => results.push(...m));
   }
 
-  onLog(`📋 Gemini found ${segments.length} segment(s) of interest.`);
-  segments.forEach((s: any) => {
-    onLog(`   ⏱ ${s.batch_start_sec}s - ${s.batch_end_sec}s (${(s.confidence * 100).toFixed(0)}%) — ${s.description}`);
-  });
+  results.sort((a, b) => a.flagged_sec - b.flagged_sec);
+  onLog(`📋 Phase 1 complete: ${results.length} flagged moment(s) total.`);
+  results.forEach(m => onLog(`   ⏱ ${m.flagged_sec.toFixed(1)}s (${(m.confidence * 100).toFixed(0)}%) — ${m.description}`));
+  return results;
+}
 
-  return segments;
+// Helper: merge nearby flagged seconds into ±padSec windows so YOLO doesn't redo overlapping work
+function buildMergedWindows(
+  moments: FlaggedMoment[],
+  padSec: number,
+  videoDurationSec: number
+): Array<{ start: number; end: number; moments: FlaggedMoment[] }> {
+  if (moments.length === 0) return [];
+  const sorted = [...moments].sort((a, b) => a.flagged_sec - b.flagged_sec);
+  const windows: Array<{ start: number; end: number; moments: FlaggedMoment[] }> = [];
+  for (const m of sorted) {
+    const s = Math.max(0, m.flagged_sec - padSec);
+    const e = Math.min(videoDurationSec, m.flagged_sec + padSec);
+    const last = windows[windows.length - 1];
+    if (last && s <= last.end) {
+      last.end = Math.max(last.end, e);
+      last.moments.push(m);
+    } else {
+      windows.push({ start: s, end: e, moments: [m] });
+    }
+  }
+  return windows;
 }
 
 // Step 2: YOLO Detection — send flagged segments to YOLO backend for object annotation
@@ -301,64 +367,78 @@ async function yoloDetectSegment(
   return detections;
 }
 
-// Step 3: Gemini Verification — send annotated frames + metadata for detailed reasoning
-async function geminiVerifyDetections(
+// Step 3: Gemini Final Reasoning — send ALL annotated frames + bbox metadata for the whole window
+async function geminiFinalReasoning(
   apiKey: string,
   query: string,
-  segmentStart: number,
+  windowStart: number,
+  windowEnd: number,
+  flaggedMoments: FlaggedMoment[],
   detections: YoloDetection[],
   onLog: (msg: string) => void
 ): Promise<Keyframe[]> {
-  // Pick up to 5 representative frames with the most detections
-  const sortedFrames = [...detections]
-    .filter(d => d.objects.length > 0)
-    .sort((a, b) => b.objects.length - a.objects.length)
-    .slice(0, 5);
-
-  if (sortedFrames.length === 0) {
-    onLog(`   ⚠️ No objects detected in segment — skipping verification.`);
+  if (detections.length === 0) {
+    onLog(`   ⚠️ No frames returned from YOLO — skipping reasoning.`);
     return [];
   }
 
-  onLog(`🧠 Step 3: Sending ${sortedFrames.length} annotated frames to Gemini for verification...`);
+  onLog(`🧠 Phase 3: Sending ${detections.length} annotated frames @ ${YOLO_WINDOW_FPS} FPS to Gemini...`);
 
-  // Build detection context
-  const frameDescriptions = sortedFrames.map(f => ({
-    timestamp: f.frame_sec,
-    objects: f.objects.map(o => `${o.label} (conf: ${(o.confidence * 100).toFixed(0)}%) at bbox [${o.bbox.join(', ')}]`)
+  const context = detections.map((d, i) => ({
+    frame_idx: i,
+    timestamp_sec: d.frame_sec,
+    detected_objects: d.objects.map((o, j) => ({
+      object_id: `f${i}_o${j}`,
+      label: o.label,
+      confidence: o.confidence,
+      bbox_1000: o.bbox,
+    }))
   }));
 
-  const verifyPrompt = `You are a forensic video analyst. I am showing you ${sortedFrames.length} frames from a video segment.
-Each frame has YOLO detection boxes drawn on it (green rectangles with labels).
+  const flaggedSummary = flaggedMoments
+    .map(m => `${m.flagged_sec.toFixed(1)}s ("${m.description}")`)
+    .join('; ');
 
-The user's query is: "${query}"
+  const prompt = `You are a forensic video analyst.
+USER QUERY: "${query}"
+COARSE SCREEN flagged these moments inside this window: ${flaggedSummary}
 
-Here are the detected objects per frame:
-${JSON.stringify(frameDescriptions, null, 2)}
+I am showing you ${detections.length} sequential frames sampled at ${YOLO_WINDOW_FPS} FPS spanning ${windowStart.toFixed(1)}s..${windowEnd.toFixed(1)}s of the original video.
+Each frame has YOLO detection boxes drawn (green rectangles with labels). Use the metadata below to refer to specific objects by object_id. Coordinates are normalized 0–1000 as [ymin, xmin, ymax, xmax].
 
-Analyze the spatial relationships, motion patterns, and interactions between detected objects across these frames.
-Return ONLY a JSON array of verified events:
-- "timestamp_sec": number (the exact second in the original video)
-- "is_incident": boolean
-- "reasoning": string (what physically happened based on object positions and motion)
-- "involved_objects": array of objects with "label" and "bbox" (normalized 0-1000: [ymin, xmin, ymax, xmax])
-- "severity": "low" | "medium" | "high"
-- "confidence": number (0-1)
+DETECTIONS:
+${JSON.stringify(context)}
 
-If no incident is confirmed, return [].`;
+Reason about object motion, trajectories, and spatial relationships across the frames. Determine:
+1. Whether a real incident matching the query actually occurred.
+2. The single most representative INCIDENT frame (peak of the event).
+3. What kind of event happened (collision, near-miss, fall, debris, intrusion, etc.).
+4. Which detected objects are involved and the role of each.
 
-  // Build parts: text prompt + annotated frame images
-  const parts: any[] = [{ text: verifyPrompt }];
-  for (const frame of sortedFrames) {
+Return ONLY a JSON object with this EXACT shape:
+{
+  "incident_detected": boolean,
+  "incident_frame_idx": number,
+  "incident_timestamp_sec": number,
+  "event_type": string,
+  "description": string,
+  "severity": "low" | "medium" | "high",
+  "confidence": number,
+  "involved_objects": [
+    { "object_id": string, "role": string }
+  ]
+}
+
+If no real incident is confirmed, set "incident_detected": false and return defaults for the other fields.`;
+
+  const parts: any[] = [{ text: prompt }];
+  for (const d of detections) {
     parts.push({
-      inlineData: {
-        mimeType: "image/jpeg",
-        data: frame.annotated_frame_b64
-      }
+      inlineData: { mimeType: "image/jpeg", data: d.annotated_frame_b64 }
     });
   }
 
-  const genRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -367,34 +447,76 @@ If no incident is confirmed, return [].`;
     })
   });
 
-  if (!genRes.ok) {
-    throw new Error(`Gemini verification failed: ${await genRes.text()}`);
+  if (!res.ok) {
+    throw new Error(`Gemini reasoning failed: ${await res.text()}`);
   }
 
-  const genData = await genRes.json();
-  const text = genData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-  let events = [];
-  try {
-    events = JSON.parse(text);
-  } catch {
-    console.error("Failed to parse Gemini verification JSON:", text);
-    throw new Error("Gemini returned invalid JSON during verification.");
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  let parsed: any = {};
+  try { parsed = JSON.parse(text); } catch {
+    onLog(`   ⚠️ Reasoning returned invalid JSON.`);
+    return [];
   }
 
-  const verifiedEvents = events.filter((e: any) => e.is_incident !== false);
+  if (!parsed.incident_detected) {
+    onLog(`   ℹ️ No incident confirmed in window ${windowStart.toFixed(1)}-${windowEnd.toFixed(1)}s.`);
+    return [];
+  }
 
-  return verifiedEvents.map((e: any, i: number) => {
-    const mainObj = e.involved_objects?.[0];
+  const idx = Math.max(0, Math.min(detections.length - 1, Number(parsed.incident_frame_idx ?? 0)));
+  const incidentFrame = detections[idx];
+  const incidentSec = Number(parsed.incident_timestamp_sec ?? incidentFrame?.frame_sec ?? windowStart);
+  const eventType = String(parsed.event_type || 'event');
+  const description = String(parsed.description || query);
+  const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0.8));
+  const involved: Array<{ object_id: string; role: string }> = Array.isArray(parsed.involved_objects) ? parsed.involved_objects : [];
+
+  const dur: [number, number] = [
+    Math.max(0, incidentSec - 1.5),
+    incidentSec + 1.5
+  ];
+
+  // Render one keyframe per involved object so each gets its own bbox overlay; if none, render a single label-only keyframe
+  if (involved.length === 0) {
+    onLog(`   ✅ Incident @ ${incidentSec.toFixed(1)}s: ${eventType} (${(confidence * 100).toFixed(0)}%) — ${description}`);
+    return [{
+      id: ++keyframeIdCounter,
+      timeSeconds: incidentSec,
+      duration: dur,
+      boundingBox: null,
+      label: `${eventType} — ${description}`,
+      confidence,
+      color: KEYFRAME_COLORS[keyframeIdCounter % KEYFRAME_COLORS.length],
+    }];
+  }
+
+  const keyframes: Keyframe[] = involved.map((inv, i) => {
+    const m = /^f(\d+)_o(\d+)$/.exec(inv.object_id || '');
+    let bbox: [number, number, number, number] | null = null;
+    if (m) {
+      const fIdx = Number(m[1]);
+      const oIdx = Number(m[2]);
+      const det = detections[fIdx];
+      const obj = det?.objects[oIdx];
+      if (obj && Array.isArray(obj.bbox) && obj.bbox.length === 4) {
+        bbox = [obj.bbox[0], obj.bbox[1], obj.bbox[2], obj.bbox[3]];
+      }
+    }
     return {
       id: ++keyframeIdCounter,
-      timeSeconds: e.timestamp_sec || segmentStart,
-      duration: [Math.max(0, (e.timestamp_sec || segmentStart) - 2), (e.timestamp_sec || segmentStart) + 2] as [number, number],
-      boundingBox: mainObj?.bbox || null,
-      label: e.reasoning || query,
-      confidence: e.confidence || 0.9,
+      timeSeconds: incidentSec,
+      duration: dur,
+      boundingBox: bbox,
+      label: `${inv.role || 'object'} — ${eventType}`,
+      confidence,
       color: KEYFRAME_COLORS[i % KEYFRAME_COLORS.length],
     };
   });
+
+  onLog(`   ✅ Incident @ ${incidentSec.toFixed(1)}s: ${eventType} (${(confidence * 100).toFixed(0)}%) — ${description}`);
+  onLog(`      Involved: ${involved.map(o => `${o.role}`).join(', ')}`);
+  return keyframes;
 }
 
 // ===== PIPELINE MEMOIZATION LOGIC IS NOW IN APP COMPONENT =====
@@ -657,10 +779,10 @@ export default function App() {
     addLog('info', `🧠 Sending query to Gemini: "${queryText}"`);
 
     try {
-      addLog('info', `🚀 Initializing Gemini-Optimized Pipeline...`);
-      addLog('info', `📊 Strategy: Gemini Screen → YOLO Annotate → Gemini Verify`);
+      addLog('info', `🚀 Initializing Chunked Multi-Phase Pipeline...`);
+      addLog('info', `📊 Phase 1: Gemini batch screen (${BATCH_SIZE_SEC}s chunks) → Phase 2: YOLO @ ${YOLO_WINDOW_FPS} FPS over ±${PADDING_SEC}s windows → Phase 3: Gemini reasoning over annotated frames`);
 
-      // Step 0: Compress
+      // Step 0: Compress (one-shot, memoized for the session)
       let currentOptFile = pipelineOptimizedFile;
       if (!currentOptFile) {
         currentOptFile = await compressVideoClientSide(videoFile, msg => addLog('info', msg));
@@ -669,7 +791,7 @@ export default function App() {
         addLog('info', `⏭️ Skip: Already compressed video.`);
       }
 
-      // Step 1a: Upload
+      // Step 1a: Upload to Gemini File API (one-shot, memoized)
       let currentGeminiUri = pipelineGeminiUri;
       if (!currentGeminiUri) {
         const fileInfo = await uploadVideoToGemini(geminiApiKey, currentOptFile, msg => addLog('info', msg));
@@ -679,50 +801,66 @@ export default function App() {
         addLog('info', `⏭️ Skip: Video already ACTIVE on Gemini servers.`);
       }
 
-      // Step 1b: Screen
-      let currentSegments = pipelineScreenedSegments;
-      if (!currentSegments || lastQueryRef.current !== queryText) {
-        currentSegments = await geminiScreenVideo(geminiApiKey, currentGeminiUri.fileUri, currentGeminiUri.mimeType, queryText, msg => addLog('info', msg));
-        setPipelineScreenedSegments(currentSegments);
+      // Step 1b: Phase 1 — Batch screen via videoMetadata (no re-upload, isolated context per chunk)
+      let currentMoments: FlaggedMoment[] | null = pipelineScreenedSegments as FlaggedMoment[] | null;
+      if (!currentMoments || lastQueryRef.current !== queryText) {
+        currentMoments = await geminiBatchScreen(
+          geminiApiKey,
+          currentGeminiUri.fileUri,
+          currentGeminiUri.mimeType,
+          queryText,
+          videoDuration,
+          scanStart,
+          scanEnd,
+          msg => addLog('info', msg)
+        );
+        setPipelineScreenedSegments(currentMoments);
         lastQueryRef.current = queryText;
       } else {
-        addLog('info', `⏭️ Skip: Video already screened for this query.`);
+        addLog('info', `⏭️ Skip: Already screened for this query.`);
       }
 
-      // Filter segments
-      const filteredSegments = currentSegments.filter((s: any) =>
-        s.batch_end_sec >= scanStart && s.batch_start_sec <= scanEnd
+      const filteredMoments = (currentMoments || []).filter(m =>
+        m.flagged_sec >= scanStart && m.flagged_sec <= (scanEnd > 0 ? scanEnd : videoDuration)
       );
 
-      if (filteredSegments.length === 0) {
-        addLog('warn', `No matches found for "${queryText}" within the specified scan range.`);
+      if (filteredMoments.length === 0) {
+        addLog('warn', `No moments flagged for "${queryText}" within the scan range.`);
         setAnalyzing(false);
         return;
       }
 
-      addLog('info', `\n📌 Processing ${filteredSegments.length} flagged segment(s)...`);
+      // Step 2: Build merged ±5s windows (overlap-safe so YOLO doesn't re-run on the same frames)
+      const windows = buildMergedWindows(filteredMoments, PADDING_SEC, videoDuration);
+      addLog('info', `\n📌 Phase 2: ${windows.length} merged window(s) (${PADDING_SEC}s padding, deduped) for YOLO annotation.`);
+
       const allKeyframes: Keyframe[] = [];
+      for (let i = 0; i < windows.length; i++) {
+        const w = windows[i];
+        addLog('info', `\n━━━ Window ${i + 1}/${windows.length}: ${w.start.toFixed(1)}s - ${w.end.toFixed(1)}s (${w.moments.length} flagged moment(s)) ━━━`);
 
-      for (let i = 0; i < filteredSegments.length; i++) {
-        const seg = filteredSegments[i];
-        addLog('info', `\n━━━ Segment ${i + 1}/${filteredSegments.length}: ${seg.batch_start_sec}s - ${seg.batch_end_sec}s ━━━`);
+        // Phase 2: YOLO @ 3 FPS over the window — gives ~30 annotated frames for a 10s window
+        const detections = await yoloDetectSegment(videoFile, w.start, w.end, YOLO_WINDOW_FPS, msg => addLog('info', msg));
 
-        // Step 2: YOLO detection
-        const detections = await yoloDetectSegment(videoFile, seg.batch_start_sec, seg.batch_end_sec, yoloFps, msg => addLog('info', msg));
+        // Phase 3: Gemini reasoning over all annotated frames + bbox metadata
+        const kfs = await geminiFinalReasoning(
+          geminiApiKey,
+          queryText,
+          w.start,
+          w.end,
+          w.moments,
+          detections,
+          msg => addLog('info', msg)
+        );
 
-        // Step 3: Gemini verification with annotated frames
-        const keyframes = await geminiVerifyDetections(geminiApiKey, queryText, seg.batch_start_sec, detections, msg => addLog('info', msg));
+        allKeyframes.push(...kfs);
 
-        allKeyframes.push(...keyframes);
-
-        if (keyframes.length > 0) {
-          addLog('success', `   🚨 ${keyframes.length} incident(s) confirmed in this segment!`);
-        } else {
-          addLog('info', `   ℹ️ No incidents confirmed in this segment.`);
+        if (kfs.length > 0) {
+          addLog('success', `   🚨 Incident confirmed in window ${i + 1}.`);
         }
       }
 
-      addLog('info', `\n✅ Pipeline complete. ${allKeyframes.length} total incident(s) verified.`);
+      addLog('info', `\n✅ Pipeline complete. ${allKeyframes.length} keyframe(s) rendered.`);
       const results = allKeyframes;
 
       // Step 3: Process results
@@ -751,7 +889,7 @@ export default function App() {
     } finally {
       setAnalyzing(false);
     }
-  }, [query, videoUrl, analyzing, videoDuration, addLog, queryHistory, jumpToKeyframe, geminiApiKey, pipelineOptimizedFile, pipelineGeminiUri, pipelineScreenedSegments, videoFile, yoloFps, scanStart, scanEnd]);
+  }, [query, videoUrl, analyzing, videoDuration, addLog, queryHistory, jumpToKeyframe, geminiApiKey, pipelineOptimizedFile, pipelineGeminiUri, pipelineScreenedSegments, videoFile, scanStart, scanEnd]);
 
   const loadPreset = useCallback((preset: PresetQuery) => {
     setQuery(preset.query);

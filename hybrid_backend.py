@@ -36,6 +36,16 @@ print("[BACKEND] Loading YOLO-World model...")
 model = YOLOWorld("yolov8s-worldv2.pt")
 print("[BACKEND] ✅ YOLO-World loaded.")
 
+# Cache the last class string so we skip the CLIP text-encode pass on repeated calls
+_last_class_key = None
+
+def set_classes_cached(class_list):
+    global _last_class_key
+    key = "|".join(class_list)
+    if key != _last_class_key:
+        model.set_classes(class_list)
+        _last_class_key = key
+
 def cleanup_file(path: str):
     try:
         if os.path.exists(path):
@@ -91,8 +101,8 @@ async def hybrid_trigger(
     detection_bbox = None
     
     with model_lock:
-        model.set_classes([query])
-        
+        set_classes_cached([query])
+
         start_frame = int(start_sec * orig_fps)
         end_frame = int(end_sec * orig_fps) if end_sec > 0 else total_frames
         
@@ -186,14 +196,16 @@ async def yolo_detect(
     file: UploadFile = File(...),
     start_sec: float = Form(0.0),
     end_sec: float = Form(10.0),
-    yolo_fps: int = Form(5),
-    classes: str = Form("car,truck,motorcycle,person,bicycle"),
+    yolo_fps: int = Form(3),
+    classes: str = Form("car,truck,motorcycle,person,bicycle,bus"),
     confidence_threshold: float = Form(0.15)
 ):
     """
-    Step 2 of Gemini-Optimized Pipeline.
-    Runs YOLO on a specific time range of the video with broad object classes.
-    Returns annotated frames (base64 JPEG) + detection metadata.
+    Phase 2 of pipeline. Given a 10s window flagged by Gemini, samples it at `yolo_fps`
+    (default 3) and returns annotated frames (base64 JPEG) + bbox metadata so Gemini
+    can do final reasoning.
+
+    Uses cap.grab() for skipped frames to avoid wasted decode work.
     """
     import base64
 
@@ -221,24 +233,25 @@ async def yolo_detect(
 
     s_frame = int(start_sec * orig_fps)
     e_frame = min(int(end_sec * orig_fps), total_frames)
-    frame_skip = max(1, int(orig_fps / yolo_fps))
+    frame_skip = max(1, int(round(orig_fps / max(1, yolo_fps))))
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, s_frame)
 
     detections = []
 
     with model_lock:
-        model.set_classes(class_list)
-        scan_total = e_frame - s_frame
+        set_classes_cached(class_list)
+        scan_total = max(0, e_frame - s_frame)
 
         with tqdm(total=scan_total, desc=f"YOLO detecting [{start_sec:.0f}s-{end_sec:.0f}s]", unit="frame") as pbar:
             current_frame = s_frame
             while current_frame < e_frame:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
+                # Only fully decode the frames we'll actually run YOLO on; grab() the rest (skip-decode optimization)
                 if (current_frame - s_frame) % frame_skip == 0:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
                     results = model.predict(frame, conf=confidence_threshold, verbose=False)
 
                     frame_objects = []
@@ -251,7 +264,6 @@ async def yolo_detect(
                             cls_id = int(box.cls[0].item())
                             label = class_list[cls_id] if cls_id < len(class_list) else f"class_{cls_id}"
 
-                            # Draw box on frame
                             color = (0, 255, 0)
                             cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                             cv2.putText(annotated_frame, f"{label} {conf:.2f}",
@@ -269,7 +281,6 @@ async def yolo_detect(
                                 ]
                             })
 
-                    # Encode annotated frame as base64 JPEG
                     _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                     b64_frame = base64.b64encode(buffer).decode('utf-8')
 
@@ -279,6 +290,9 @@ async def yolo_detect(
                         "annotated_frame_b64": b64_frame,
                         "objects": frame_objects
                     })
+                else:
+                    if not cap.grab():
+                        break
 
                 current_frame += 1
                 pbar.update(1)
