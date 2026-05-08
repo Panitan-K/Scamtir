@@ -24,3 +24,17 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+
+# Claude Code worktrees / scratch
+.claude/worktrees/
+.claude/launch.json
+.claude/settings.local.json
