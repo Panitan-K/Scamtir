@@ -14,14 +14,50 @@ interface LogEntry {
   message: string;
 }
 
-interface Keyframe {
+interface InvolvedObject {
+  role: string;                               // "striking vehicle", "victim", "obstacle", ...
+  label: string;                              // YOLO class: "car", "motorcycle"
+  yoloConfidence: number;
+  bbox: [number, number, number, number];     // [ymin, xmin, ymax, xmax] normalized 0-1000
+  fromFrameIdx: number;                       // which YOLO frame the bbox was sampled from
+}
+
+interface IncidentTrace {
+  query: string;
+  windowStart: number;
+  windowEnd: number;
+  flaggedMoments: Array<{ flagged_sec: number; confidence: number; description: string }>;
+  yoloFrames: Array<{
+    frameSec: number;
+    annotatedB64: string;                     // base64 JPEG (kept for the inspection modal)
+    objects: Array<{ label: string; confidence: number; bbox: number[] }>;
+  }>;
+  rawGeminiResponse: string;
+}
+
+interface Incident {
   id: number;
-  timeSeconds: number;
-  duration: [number, number]; // [start, end]
-  boundingBox: [number, number, number, number] | null; // [ymin, xmin, ymax, xmax] scaled to 1000
-  label: string;
+  timeSeconds: number;                        // peak moment
+  duration: [number, number];                 // bbox display window
+  eventType: string;                          // short label, e.g. "rear-end collision"
+  description: string;
+  severity: 'low' | 'medium' | 'high';
   confidence: number;
-  color: string;
+  color: string;                              // overlay accent color
+  involved: InvolvedObject[];
+  trace: IncidentTrace;
+}
+
+type PipelinePhase = 'idle' | 'compress' | 'upload' | 'screen' | 'yolo' | 'reason' | 'done' | 'error';
+
+interface PipelineProgress {
+  phase: PipelinePhase;
+  message: string;
+  batchesTotal: number;
+  batchesDone: number;
+  windowsTotal: number;
+  windowsDone: number;
+  incidentsFound: number;
 }
 
 interface PresetQuery {
@@ -214,12 +250,78 @@ interface FlaggedMoment {
   description: string;
 }
 
+// ----- Phase 0: Query Interpretation -----
+// One up-front Gemini text call that expands a broad query (e.g. "อุบัติเหตุ") into
+// concrete visual cues + YOLO class hints. Phase 1/2/3 all use this expansion.
+interface QueryInterpretation {
+  english_translation: string;
+  expanded_meaning: string;
+  visual_categories: string[];   // e.g. "vehicle hitting roadside barrier", "motorcycle fall"
+  target_objects: string[];       // YOLO-World class hints, e.g. "traffic barrier", "debris"
+}
+
+async function geminiInterpretQuery(
+  apiKey: string,
+  query: string,
+  onLog: (msg: string) => void
+): Promise<QueryInterpretation> {
+  onLog(`🧭 Phase 0: Interpreting query "${query}"...`);
+
+  const prompt = `You are a forensic video search query interpreter. The user query may be in Thai, English, or another language and is often broad/abstract (e.g. "อุบัติเหตุ" = "accident").
+
+Expand the query into concrete visual cues a downstream object detector and frame-level analyst can act on. Be exhaustive — broad queries should expand to many sub-cases.
+
+Return ONLY a JSON object:
+{
+  "english_translation": string,           // literal English translation of the query
+  "expanded_meaning": string,              // one sentence describing what this query covers in practice
+  "visual_categories": [string, ...],      // 4–10 specific event types this query could match (e.g. "vehicle-vehicle collision", "vehicle hitting roadside barrier", "pedestrian struck", "motorcycle fall", "rollover", "debris/obstacle on road", "rear-end crash", "near-miss"). NOT just the literal query.
+  "target_objects": [string, ...]          // every kind of physical object that should be detected (e.g. "car", "truck", "motorcycle", "person", "bicycle", "bus", "traffic cone", "traffic barrier", "barricade", "guardrail", "road sign", "debris", "fallen object", "construction equipment"). Include obstacles and infrastructure, not just vehicles. Use plain English noun phrases YOLO-World can ground.
+}
+
+Query: "${query}"`;
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json', temperature: 0.2 }
+      })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    const parsed = JSON.parse(text) || {};
+    const interp: QueryInterpretation = {
+      english_translation: String(parsed.english_translation || query),
+      expanded_meaning: String(parsed.expanded_meaning || query),
+      visual_categories: Array.isArray(parsed.visual_categories) && parsed.visual_categories.length > 0 ? parsed.visual_categories.map(String) : [query],
+      target_objects: Array.isArray(parsed.target_objects) && parsed.target_objects.length > 0 ? parsed.target_objects.map(String) : ['car', 'truck', 'motorcycle', 'person', 'bicycle', 'bus'],
+    };
+    onLog(`   • "${query}" → "${interp.english_translation}"`);
+    onLog(`   • Looking for: ${interp.visual_categories.join(', ')}`);
+    onLog(`   • Target objects: ${interp.target_objects.join(', ')}`);
+    return interp;
+  } catch (err) {
+    onLog(`   ⚠️ Interpretation failed (${err instanceof Error ? err.message : String(err)}) — using literal query as fallback.`);
+    return {
+      english_translation: query,
+      expanded_meaning: query,
+      visual_categories: [query],
+      target_objects: ['car', 'truck', 'motorcycle', 'person', 'bicycle', 'bus'],
+    };
+  }
+}
+
 // Step 1: Gemini Batch Screening — chop video into <10s windows, ask each for the EXACT second of the event
 async function geminiBatchScreen(
   apiKey: string,
   fileUri: string,
   mimeType: string,
   query: string,
+  interpretation: QueryInterpretation,
   videoDurationSec: number,
   scanStart: number,
   scanEnd: number,
@@ -236,14 +338,19 @@ async function geminiBatchScreen(
   onLog(`📦 Phase 1: Screening ${batches.length} batch(es) of ≤${BATCH_SIZE_SEC}s for "${query}"...`);
 
   const screenPrompt = `You are a video screening engine.
-Watch this short clip carefully and identify the EXACT second(s) when this occurs: "${query}"
+
+USER QUERY: "${query}" — meaning: ${interpretation.expanded_meaning}
+ANY of these events should be flagged (do NOT only match the literal query): ${interpretation.visual_categories.join('; ')}
+
+Watch this short clip carefully and identify the EXACT second(s) when ANY matching event occurs.
 
 Return ONLY a JSON array. Each item must have:
 - "flagged_sec": number (the precise second in the ORIGINAL full video where the event occurs — use the timestamps you observe in this clip)
-- "confidence": number between 0 and 1
-- "description": string (one short sentence describing what you saw at that moment)
+- "confidence": number between 0 and 1 — be confident (>0.8) when an event is clearly visible; only use <0.5 for ambiguous frames
+- "description": string (one short, specific sentence: WHAT collided with WHAT, WHO fell, etc.)
 
 Be precise. Pick the single most representative second per event. If multiple distinct events happen, list each.
+It is critical that you do not miss real incidents. When in doubt, INCLUDE the moment with moderate confidence — Phase 3 will refine it.
 If nothing in this clip matches, return [].`;
 
   async function screenOne(batch: { start: number; end: number }): Promise<FlaggedMoment[]> {
@@ -339,16 +446,20 @@ async function yoloDetectSegment(
   startSec: number,
   endSec: number,
   yoloFps: number,
+  classes: string[],
   onLog: (msg: string) => void
 ): Promise<YoloDetection[]> {
-  onLog(`🔧 YOLO scanning segment ${startSec}s - ${endSec}s at ${yoloFps} FPS...`);
+  // Always include universal vehicle/person defaults, then merge interpretation hints (cap to keep YOLO-World responsive).
+  const defaults = ['car', 'truck', 'motorcycle', 'person', 'bicycle', 'bus'];
+  const merged = Array.from(new Set([...defaults, ...classes.map(c => c.trim().toLowerCase()).filter(Boolean)])).slice(0, 24);
+  onLog(`🔧 YOLO scanning ${startSec}s-${endSec}s @ ${yoloFps} FPS · classes: ${merged.join(', ')}`);
 
   const formData = new FormData();
   formData.append('file', videoFile);
   formData.append('start_sec', startSec.toString());
   formData.append('end_sec', endSec.toString());
   formData.append('yolo_fps', yoloFps.toString());
-  formData.append('classes', 'car,truck,motorcycle,person,bicycle,bus');
+  formData.append('classes', merged.join(','));
 
   const res = await fetch('http://localhost:8000/yolo_detect', {
     method: 'POST',
@@ -367,26 +478,48 @@ async function yoloDetectSegment(
   return detections;
 }
 
-// Step 3: Gemini Final Reasoning — send ALL annotated frames + bbox metadata for the whole window
+// Sample N items evenly from a list (preserves first + last so the impact moment isn't dropped).
+function sampleEvenly<T>(arr: T[], n: number): T[] {
+  if (arr.length <= n) return arr;
+  const out: T[] = [];
+  const step = (arr.length - 1) / (n - 1);
+  for (let i = 0; i < n; i++) out.push(arr[Math.round(i * step)]);
+  return out;
+}
+
+const REASONING_FRAME_BUDGET = 14;
+
+// Step 3: Gemini Final Reasoning — Phase 1 has already CONFIRMED the incident. Phase 3's job is to
+// LOCATE the peak frame and identify involved parties — NOT to re-litigate whether it happened.
 async function geminiFinalReasoning(
   apiKey: string,
   query: string,
+  interpretation: QueryInterpretation,
   windowStart: number,
   windowEnd: number,
   flaggedMoments: FlaggedMoment[],
   detections: YoloDetection[],
   onLog: (msg: string) => void
-): Promise<Keyframe[]> {
+): Promise<Incident[]> {
+  // Highest-confidence flagged moment in this window — the authoritative Phase 1 finding.
+  const topMoment = flaggedMoments.length > 0
+    ? flaggedMoments.reduce((a, b) => a.confidence > b.confidence ? a : b)
+    : null;
+
   if (detections.length === 0) {
-    onLog(`   ⚠️ No frames returned from YOLO — skipping reasoning.`);
+    onLog(`   ⚠️ No frames returned from YOLO — using Phase 1 finding directly.`);
+    if (topMoment) return [phase1Fallback(query, windowStart, windowEnd, flaggedMoments, [], topMoment)];
     return [];
   }
 
-  onLog(`🧠 Phase 3: Sending ${detections.length} annotated frames @ ${YOLO_WINDOW_FPS} FPS to Gemini...`);
+  // Send a small even sample of images, but ALL detection metadata so the verifier can reason about trajectories.
+  const sentFrames = sampleEvenly(detections, REASONING_FRAME_BUDGET);
+  onLog(`🧠 Phase 3: Localizing peak frame · sending ${sentFrames.length}/${detections.length} frames + full detection timeline...`);
 
   const context = detections.map((d, i) => ({
     frame_idx: i,
     timestamp_sec: d.frame_sec,
+    sent_image: sentFrames.includes(d),
     detected_objects: d.objects.map((o, j) => ({
       object_id: `f${i}_o${j}`,
       label: o.label,
@@ -396,43 +529,51 @@ async function geminiFinalReasoning(
   }));
 
   const flaggedSummary = flaggedMoments
-    .map(m => `${m.flagged_sec.toFixed(1)}s ("${m.description}")`)
+    .map(m => `${m.flagged_sec.toFixed(1)}s @ ${(m.confidence * 100).toFixed(0)}% ("${m.description}")`)
     .join('; ');
 
-  const prompt = `You are a forensic video analyst.
-USER QUERY: "${query}"
-COARSE SCREEN flagged these moments inside this window: ${flaggedSummary}
+  const prompt = `You are a forensic video analyst LOCATING an already-confirmed incident.
 
-I am showing you ${detections.length} sequential frames sampled at ${YOLO_WINDOW_FPS} FPS spanning ${windowStart.toFixed(1)}s..${windowEnd.toFixed(1)}s of the original video.
-Each frame has YOLO detection boxes drawn (green rectangles with labels). Use the metadata below to refer to specific objects by object_id. Coordinates are normalized 0–1000 as [ymin, xmin, ymax, xmax].
+PHASE 1 (a separate Gemini agent) has ALREADY screened this video and CONFIRMED matching moment(s) in this window:
+${flaggedSummary || '(none — locate from frames alone)'}
+
+USER QUERY: "${query}" — meaning: "${interpretation.expanded_meaning}"
+Visual categories that match this query: ${interpretation.visual_categories.join('; ')}
+
+YOUR JOB IS NOT TO RE-LITIGATE WHETHER THE INCIDENT HAPPENED.
+Phase 1 saw the entire video; trust its description. Your job is:
+1. LOCATE the single most representative "peak" frame for each distinct incident (moment of impact / clearest visible state).
+2. IDENTIFY which detected objects are involved (by object_id) and assign a role to each (e.g. "striking vehicle", "victim", "obstacle hit", "second vehicle", "bystander").
+3. Refine the textual description to match the YOLO-annotated visual evidence.
+
+If YOLO missed the obstacle/target (e.g. traffic barriers, debris, road furniture not in the class list), DO NOT downgrade — Phase 1 already saw it. Describe it textually under "description" and only list the visible parties under involved_objects.
+
+I am sending ${sentFrames.length} frames evenly sampled from ${windowStart.toFixed(1)}s..${windowEnd.toFixed(1)}s, with green YOLO boxes drawn. The DETECTIONS array below covers EVERY frame's metadata (not just sent images), so you can reason about object positions/trajectories across the whole window. Coordinates are normalized 0–1000 as [ymin, xmin, ymax, xmax].
 
 DETECTIONS:
 ${JSON.stringify(context)}
 
-Reason about object motion, trajectories, and spatial relationships across the frames. Determine:
-1. Whether a real incident matching the query actually occurred.
-2. The single most representative INCIDENT frame (peak of the event).
-3. What kind of event happened (collision, near-miss, fall, debris, intrusion, etc.).
-4. Which detected objects are involved and the role of each.
-
 Return ONLY a JSON object with this EXACT shape:
 {
-  "incident_detected": boolean,
-  "incident_frame_idx": number,
-  "incident_timestamp_sec": number,
-  "event_type": string,
-  "description": string,
-  "severity": "low" | "medium" | "high",
-  "confidence": number,
-  "involved_objects": [
-    { "object_id": string, "role": string }
+  "incidents": [
+    {
+      "incident_frame_idx": number,
+      "incident_timestamp_sec": number,
+      "event_type": string,
+      "description": string,
+      "severity": "low" | "medium" | "high",
+      "confidence": number,
+      "involved_objects": [
+        { "object_id": string, "role": string }
+      ]
+    }
   ]
 }
 
-If no real incident is confirmed, set "incident_detected": false and return defaults for the other fields.`;
+CRITICAL: only return { "incidents": [] } if you can clearly prove Phase 1's findings are contradicted by the YOLO evidence (e.g. the window shows an empty road with zero relevant objects). When in doubt, return at least one incident built from Phase 1's description and the most plausible peak frame.`;
 
   const parts: any[] = [{ text: prompt }];
-  for (const d of detections) {
+  for (const d of sentFrames) {
     parts.push({
       inlineData: { mimeType: "image/jpeg", data: d.annotated_frame_b64 }
     });
@@ -452,71 +593,153 @@ If no real incident is confirmed, set "incident_detected": false and return defa
   }
 
   const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
   let parsed: any = {};
-  try { parsed = JSON.parse(text); } catch {
-    onLog(`   ⚠️ Reasoning returned invalid JSON.`);
+  try { parsed = JSON.parse(rawText); } catch {
+    onLog(`   ⚠️ Reasoning returned invalid JSON — falling back to Phase 1 finding.`);
+    if (topMoment) return [phase1Fallback(query, windowStart, windowEnd, flaggedMoments, detections, topMoment)];
     return [];
   }
 
-  if (!parsed.incident_detected) {
+  const rawIncidents: any[] = Array.isArray(parsed.incidents) ? parsed.incidents : [];
+  if (rawIncidents.length === 0) {
+    if (topMoment && topMoment.confidence >= 0.7) {
+      onLog(`   ⚠️ Localizer returned empty but Phase 1 was ${(topMoment.confidence * 100).toFixed(0)}% — keeping Phase 1 finding.`);
+      return [phase1Fallback(query, windowStart, windowEnd, flaggedMoments, detections, topMoment)];
+    }
     onLog(`   ℹ️ No incident confirmed in window ${windowStart.toFixed(1)}-${windowEnd.toFixed(1)}s.`);
     return [];
   }
 
-  const idx = Math.max(0, Math.min(detections.length - 1, Number(parsed.incident_frame_idx ?? 0)));
-  const incidentFrame = detections[idx];
-  const incidentSec = Number(parsed.incident_timestamp_sec ?? incidentFrame?.frame_sec ?? windowStart);
-  const eventType = String(parsed.event_type || 'event');
-  const description = String(parsed.description || query);
-  const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0.8));
-  const involved: Array<{ object_id: string; role: string }> = Array.isArray(parsed.involved_objects) ? parsed.involved_objects : [];
+  // Build the trace once per window — shared across the incidents that come out of it
+  const trace: IncidentTrace = {
+    query,
+    windowStart,
+    windowEnd,
+    flaggedMoments: flaggedMoments.map(m => ({
+      flagged_sec: m.flagged_sec,
+      confidence: m.confidence,
+      description: m.description,
+    })),
+    yoloFrames: detections.map(d => ({
+      frameSec: d.frame_sec,
+      annotatedB64: d.annotated_frame_b64,
+      objects: d.objects.map(o => ({ label: o.label, confidence: o.confidence, bbox: o.bbox })),
+    })),
+    rawGeminiResponse: rawText,
+  };
 
-  const dur: [number, number] = [
-    Math.max(0, incidentSec - 1.5),
-    incidentSec + 1.5
-  ];
+  const incidents: Incident[] = rawIncidents.map((raw): Incident => {
+    const idx = Math.max(0, Math.min(detections.length - 1, Number(raw.incident_frame_idx ?? 0)));
+    const incidentFrame = detections[idx];
+    const incidentSec = Number(raw.incident_timestamp_sec ?? incidentFrame?.frame_sec ?? windowStart);
+    const eventType = String(raw.event_type || 'event');
+    const description = String(raw.description || query);
+    const severity: 'low' | 'medium' | 'high' = (['low', 'medium', 'high'] as const).includes(raw.severity) ? raw.severity : 'medium';
+    const localizerConf = Math.max(0, Math.min(1, Number(raw.confidence) || 0.8));
+    // Confidence floor: never drop below Phase 1's confidence × 0.9 — the localizer can only refine, not invalidate
+    const phase1Floor = topMoment ? topMoment.confidence * 0.9 : 0;
+    const confidence = Math.max(phase1Floor, localizerConf);
+    const involvedRaw: Array<{ object_id: string; role: string }> = Array.isArray(raw.involved_objects) ? raw.involved_objects : [];
 
-  // Render one keyframe per involved object so each gets its own bbox overlay; if none, render a single label-only keyframe
-  if (involved.length === 0) {
-    onLog(`   ✅ Incident @ ${incidentSec.toFixed(1)}s: ${eventType} (${(confidence * 100).toFixed(0)}%) — ${description}`);
-    return [{
-      id: ++keyframeIdCounter,
-      timeSeconds: incidentSec,
-      duration: dur,
-      boundingBox: null,
-      label: `${eventType} — ${description}`,
-      confidence,
-      color: KEYFRAME_COLORS[keyframeIdCounter % KEYFRAME_COLORS.length],
-    }];
-  }
-
-  const keyframes: Keyframe[] = involved.map((inv, i) => {
-    const m = /^f(\d+)_o(\d+)$/.exec(inv.object_id || '');
-    let bbox: [number, number, number, number] | null = null;
-    if (m) {
+    const involved: InvolvedObject[] = involvedRaw.flatMap(inv => {
+      const m = /^f(\d+)_o(\d+)$/.exec(inv.object_id || '');
+      if (!m) return [];
       const fIdx = Number(m[1]);
       const oIdx = Number(m[2]);
       const det = detections[fIdx];
       const obj = det?.objects[oIdx];
-      if (obj && Array.isArray(obj.bbox) && obj.bbox.length === 4) {
-        bbox = [obj.bbox[0], obj.bbox[1], obj.bbox[2], obj.bbox[3]];
-      }
-    }
+      if (!obj || !Array.isArray(obj.bbox) || obj.bbox.length !== 4) return [];
+      return [{
+        role: inv.role || 'object',
+        label: obj.label,
+        yoloConfidence: obj.confidence,
+        bbox: [obj.bbox[0], obj.bbox[1], obj.bbox[2], obj.bbox[3]] as [number, number, number, number],
+        fromFrameIdx: fIdx,
+      }];
+    });
+
+    const id = ++keyframeIdCounter;
     return {
-      id: ++keyframeIdCounter,
+      id,
       timeSeconds: incidentSec,
-      duration: dur,
-      boundingBox: bbox,
-      label: `${inv.role || 'object'} — ${eventType}`,
+      duration: [Math.max(0, incidentSec - 1.5), incidentSec + 1.5] as [number, number],
+      eventType,
+      description,
+      severity,
       confidence,
-      color: KEYFRAME_COLORS[i % KEYFRAME_COLORS.length],
+      color: KEYFRAME_COLORS[id % KEYFRAME_COLORS.length],
+      involved,
+      trace,
     };
   });
 
-  onLog(`   ✅ Incident @ ${incidentSec.toFixed(1)}s: ${eventType} (${(confidence * 100).toFixed(0)}%) — ${description}`);
-  onLog(`      Involved: ${involved.map(o => `${o.role}`).join(', ')}`);
-  return keyframes;
+  incidents.forEach(inc => {
+    onLog(`   ✅ Incident @ ${inc.timeSeconds.toFixed(1)}s [${inc.severity}]: ${inc.eventType} (${(inc.confidence * 100).toFixed(0)}%) — ${inc.description}`);
+    if (inc.involved.length > 0) {
+      onLog(`      Involved: ${inc.involved.map(o => `${o.role} (${o.label})`).join(', ')}`);
+    }
+  });
+
+  return incidents;
+}
+
+// Build an Incident directly from Phase 1's finding when Phase 3 fails or invalidates without justification.
+function phase1Fallback(
+  query: string,
+  windowStart: number,
+  windowEnd: number,
+  flaggedMoments: FlaggedMoment[],
+  detections: YoloDetection[],
+  topMoment: FlaggedMoment
+): Incident {
+  // Pick the YOLO frame closest to topMoment.flagged_sec (so the inspector still has a peak frame)
+  let closestIdx = 0;
+  let closestDelta = Infinity;
+  detections.forEach((d, i) => {
+    const delta = Math.abs(d.frame_sec - topMoment.flagged_sec);
+    if (delta < closestDelta) { closestDelta = delta; closestIdx = i; }
+  });
+
+  const trace: IncidentTrace = {
+    query,
+    windowStart,
+    windowEnd,
+    flaggedMoments: flaggedMoments.map(m => ({ flagged_sec: m.flagged_sec, confidence: m.confidence, description: m.description })),
+    yoloFrames: detections.map(d => ({
+      frameSec: d.frame_sec,
+      annotatedB64: d.annotated_frame_b64,
+      objects: d.objects.map(o => ({ label: o.label, confidence: o.confidence, bbox: o.bbox })),
+    })),
+    rawGeminiResponse: '(Phase 3 returned empty — keyframe built from Phase 1 finding)',
+  };
+
+  // Promote the top-2 YOLO objects in the closest frame as "involved" so the UI still has bboxes.
+  const involved: InvolvedObject[] = (detections[closestIdx]?.objects || [])
+    .slice()
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 3)
+    .map(o => ({
+      role: 'visible party',
+      label: o.label,
+      yoloConfidence: o.confidence,
+      bbox: [o.bbox[0], o.bbox[1], o.bbox[2], o.bbox[3]] as [number, number, number, number],
+      fromFrameIdx: closestIdx,
+    }));
+
+  const id = ++keyframeIdCounter;
+  return {
+    id,
+    timeSeconds: topMoment.flagged_sec,
+    duration: [Math.max(0, topMoment.flagged_sec - 1.5), topMoment.flagged_sec + 1.5] as [number, number],
+    eventType: 'screened event',
+    description: topMoment.description,
+    severity: 'medium',
+    confidence: topMoment.confidence,
+    color: KEYFRAME_COLORS[id % KEYFRAME_COLORS.length],
+    involved,
+    trace,
+  };
 }
 
 // ===== PIPELINE MEMOIZATION LOGIC IS NOW IN APP COMPONENT =====
@@ -596,8 +819,10 @@ export default function App() {
     createLog('info', 'Upload a video or connect a stream to begin.'),
   ]);
   const [analyzing, setAnalyzing] = useState(false);
-  const [keyframes, setKeyframes] = useState<Keyframe[]>([]);
-  const [activeKeyframe, setActiveKeyframe] = useState<Keyframe | null>(null);
+  const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [activeIncidentId, setActiveIncidentId] = useState<number | null>(null);
+  const [inspectIncidentId, setInspectIncidentId] = useState<number | null>(null); // modal target
+  const [confidenceFilter, setConfidenceFilter] = useState<number>(0); // 0..1; hide below threshold
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [videoDuration, setVideoDuration] = useState(0);
@@ -605,9 +830,20 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [queryHistory, setQueryHistory] = useState<string[]>([]);
-  const [yoloFps, setYoloFps] = useState<number>(5);
   const [scanStart, setScanStart] = useState<number>(0);
   const [scanEnd, setScanEnd] = useState<number>(0);
+
+  // Rendered video rect within the wrapper — letterbox/pillarbox aware so bboxes line up exactly
+  const [videoFitRect, setVideoFitRect] = useState({ left: 0, top: 0, width: 0, height: 0 });
+
+  // Live pipeline progress (drives the progress panel + analyzing overlay)
+  const [progress, setProgress] = useState<PipelineProgress>({
+    phase: 'idle',
+    message: 'Idle.',
+    batchesTotal: 0, batchesDone: 0,
+    windowsTotal: 0, windowsDone: 0,
+    incidentsFound: 0,
+  });
 
   // Gemini API key management
   const [geminiApiKey, setGeminiApiKey] = useState<string>(ENV_API_KEY || '');
@@ -619,7 +855,8 @@ export default function App() {
   // Pipeline Memoization State
   const [pipelineOptimizedFile, setPipelineOptimizedFile] = useState<File | null>(null);
   const [pipelineGeminiUri, setPipelineGeminiUri] = useState<{ fileUri: string, mimeType: string } | null>(null);
-  const [pipelineScreenedSegments, setPipelineScreenedSegments] = useState<any[] | null>(null);
+  const [pipelineScreenedSegments, setPipelineScreenedSegments] = useState<FlaggedMoment[] | null>(null);
+  const [pipelineInterpretation, setPipelineInterpretation] = useState<QueryInterpretation | null>(null);
   const lastQueryRef = useRef<string>('');
 
   // Check backend health
@@ -660,10 +897,56 @@ export default function App() {
   }, []);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const videoWrapperRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const logFeedRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
+
+  // Recompute the rendered video rect whenever the wrapper resizes or the video metadata changes.
+  // This is the key fix for "weird detection box positions" — bboxes are positioned within this rect
+  // (which exactly matches the displayed video pixels, accounting for letterbox/pillarbox).
+  useEffect(() => {
+    const compute = () => {
+      const v = videoRef.current;
+      const w = videoWrapperRef.current;
+      if (!v || !w) return;
+      const vw = v.videoWidth;
+      const vh = v.videoHeight;
+      const wrapper = w.getBoundingClientRect();
+      if (!vw || !vh || !wrapper.width || !wrapper.height) return;
+      const videoAspect = vw / vh;
+      const wrapperAspect = wrapper.width / wrapper.height;
+      let renderW: number, renderH: number, left: number, top: number;
+      if (wrapperAspect > videoAspect) {
+        // wrapper is wider than the video → pillarbox (vertical bars left/right)
+        renderH = wrapper.height;
+        renderW = renderH * videoAspect;
+        left = (wrapper.width - renderW) / 2;
+        top = 0;
+      } else {
+        // wrapper is taller than the video → letterbox (bars top/bottom)
+        renderW = wrapper.width;
+        renderH = renderW / videoAspect;
+        left = 0;
+        top = (wrapper.height - renderH) / 2;
+      }
+      setVideoFitRect({ left, top, width: renderW, height: renderH });
+    };
+    compute();
+    const v = videoRef.current;
+    const w = videoWrapperRef.current;
+    if (!v || !w) return;
+    const ro = new ResizeObserver(compute);
+    ro.observe(w);
+    v.addEventListener('loadedmetadata', compute);
+    window.addEventListener('resize', compute);
+    return () => {
+      ro.disconnect();
+      v.removeEventListener('loadedmetadata', compute);
+      window.removeEventListener('resize', compute);
+    };
+  }, [videoUrl, videoDim.w, videoDim.h]);
 
   // Auto-scroll log feed
   useEffect(() => {
@@ -682,12 +965,18 @@ export default function App() {
     setVideoFile(file);
     const url = URL.createObjectURL(file);
     setVideoUrl(url);
-    setKeyframes([]);
-    setActiveKeyframe(null);
+    setIncidents([]);
+    setActiveIncidentId(null);
+    setInspectIncidentId(null);
     setPipelineOptimizedFile(null);
     setPipelineGeminiUri(null);
     setPipelineScreenedSegments(null);
+    setPipelineInterpretation(null);
     lastQueryRef.current = '';
+    setProgress({
+      phase: 'idle', message: 'Idle.',
+      batchesTotal: 0, batchesDone: 0, windowsTotal: 0, windowsDone: 0, incidentsFound: 0,
+    });
     addLog('success', `Video loaded: ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)`);
   }, [addLog]);
 
@@ -737,11 +1026,19 @@ export default function App() {
     seekTo(pct * videoDuration);
   }, [videoDuration, seekTo]);
 
-  const jumpToKeyframe = useCallback((kf: Keyframe) => {
-    setActiveKeyframe(kf);
-    seekTo(kf.timeSeconds);
-    addLog('detect', `Jumped to keyframe at ${formatVideoTime(kf.timeSeconds)}: "${kf.label}" (${(kf.confidence * 100).toFixed(0)}%)`);
+  const jumpToIncident = useCallback((inc: Incident) => {
+    setActiveIncidentId(inc.id);
+    seekTo(inc.timeSeconds);
+    addLog('detect', `Jumped to ${formatVideoTime(inc.timeSeconds)} — ${inc.eventType}: ${inc.description} (${(inc.confidence * 100).toFixed(0)}%)`);
   }, [seekTo, addLog]);
+
+  const openInspector = useCallback((inc: Incident) => {
+    setInspectIncidentId(inc.id);
+  }, []);
+
+  const closeInspector = useCallback(() => {
+    setInspectIncidentId(null);
+  }, []);
 
   const saveApiKey = useCallback((key: string) => {
     setGeminiApiKey(key);
@@ -768,19 +1065,22 @@ export default function App() {
     if (analyzing) return;
 
     setAnalyzing(true);
-    setKeyframes([]);
-    setActiveKeyframe(null);
+    setIncidents([]);
+    setActiveIncidentId(null);
+    setInspectIncidentId(null);
 
     const queryText = query.trim();
     if (!queryHistory.includes(queryText)) {
       setQueryHistory(prev => [queryText, ...prev].slice(0, 10));
     }
 
-    addLog('info', `🧠 Sending query to Gemini: "${queryText}"`);
+    const setProg = (patch: Partial<PipelineProgress>) => setProgress(prev => ({ ...prev, ...patch }));
+
+    addLog('info', `🧠 Query: "${queryText}"`);
 
     try {
-      addLog('info', `🚀 Initializing Chunked Multi-Phase Pipeline...`);
-      addLog('info', `📊 Phase 1: Gemini batch screen (${BATCH_SIZE_SEC}s chunks) → Phase 2: YOLO @ ${YOLO_WINDOW_FPS} FPS over ±${PADDING_SEC}s windows → Phase 3: Gemini reasoning over annotated frames`);
+      setProg({ phase: 'compress', message: 'Preparing video...', batchesTotal: 0, batchesDone: 0, windowsTotal: 0, windowsDone: 0, incidentsFound: 0 });
+      addLog('info', `🚀 Multi-phase pipeline starting (chunk size ${BATCH_SIZE_SEC}s · YOLO ${YOLO_WINDOW_FPS} FPS · ±${PADDING_SEC}s windows)`);
 
       // Step 0: Compress (one-shot, memoized for the session)
       let currentOptFile = pipelineOptimizedFile;
@@ -792,6 +1092,7 @@ export default function App() {
       }
 
       // Step 1a: Upload to Gemini File API (one-shot, memoized)
+      setProg({ phase: 'upload', message: 'Uploading video to Gemini File API...' });
       let currentGeminiUri = pipelineGeminiUri;
       if (!currentGeminiUri) {
         const fileInfo = await uploadVideoToGemini(geminiApiKey, currentOptFile, msg => addLog('info', msg));
@@ -801,18 +1102,37 @@ export default function App() {
         addLog('info', `⏭️ Skip: Video already ACTIVE on Gemini servers.`);
       }
 
-      // Step 1b: Phase 1 — Batch screen via videoMetadata (no re-upload, isolated context per chunk)
-      let currentMoments: FlaggedMoment[] | null = pipelineScreenedSegments as FlaggedMoment[] | null;
+      // Phase 0 — Interpret the query (broad → specific visual cues + class hints)
+      let currentInterpretation = pipelineInterpretation;
+      if (!currentInterpretation || lastQueryRef.current !== queryText) {
+        currentInterpretation = await geminiInterpretQuery(geminiApiKey, queryText, msg => addLog('info', msg));
+        setPipelineInterpretation(currentInterpretation);
+      } else {
+        addLog('info', `⏭️ Skip: Query already interpreted.`);
+      }
+
+      // Phase 1 — Batch screen via videoMetadata (now using the expanded interpretation)
+      setProg({ phase: 'screen', message: 'Phase 1: chunked batch screening...' });
+      let currentMoments: FlaggedMoment[] | null = pipelineScreenedSegments;
       if (!currentMoments || lastQueryRef.current !== queryText) {
+        const totalBatches = Math.max(1, Math.ceil(((scanEnd > 0 ? scanEnd : videoDuration) - scanStart) / BATCH_SIZE_SEC));
+        setProg({ batchesTotal: totalBatches, batchesDone: 0 });
         currentMoments = await geminiBatchScreen(
           geminiApiKey,
           currentGeminiUri.fileUri,
           currentGeminiUri.mimeType,
           queryText,
+          currentInterpretation,
           videoDuration,
           scanStart,
           scanEnd,
-          msg => addLog('info', msg)
+          msg => {
+            addLog('info', msg);
+            // Crude per-batch progress nudge based on log lines
+            if (msg.includes('Batch ') && (msg.includes('flagged') || msg.includes('failed'))) {
+              setProgress(prev => ({ ...prev, batchesDone: Math.min(prev.batchesTotal, prev.batchesDone + 1) }));
+            }
+          }
         );
         setPipelineScreenedSegments(currentMoments);
         lastQueryRef.current = queryText;
@@ -826,26 +1146,29 @@ export default function App() {
 
       if (filteredMoments.length === 0) {
         addLog('warn', `No moments flagged for "${queryText}" within the scan range.`);
+        setProg({ phase: 'done', message: 'No matches.' });
         setAnalyzing(false);
         return;
       }
 
-      // Step 2: Build merged ±5s windows (overlap-safe so YOLO doesn't re-run on the same frames)
+      // Phase 2: Build merged ±5s windows
       const windows = buildMergedWindows(filteredMoments, PADDING_SEC, videoDuration);
-      addLog('info', `\n📌 Phase 2: ${windows.length} merged window(s) (${PADDING_SEC}s padding, deduped) for YOLO annotation.`);
+      setProg({ phase: 'yolo', message: `Phase 2: YOLO over ${windows.length} window(s)...`, windowsTotal: windows.length, windowsDone: 0 });
+      addLog('info', `📌 Phase 2: ${windows.length} merged window(s) (${PADDING_SEC}s padding, deduped) for YOLO annotation.`);
 
-      const allKeyframes: Keyframe[] = [];
+      const allIncidents: Incident[] = [];
       for (let i = 0; i < windows.length; i++) {
         const w = windows[i];
-        addLog('info', `\n━━━ Window ${i + 1}/${windows.length}: ${w.start.toFixed(1)}s - ${w.end.toFixed(1)}s (${w.moments.length} flagged moment(s)) ━━━`);
+        addLog('info', `━━━ Window ${i + 1}/${windows.length}: ${w.start.toFixed(1)}s-${w.end.toFixed(1)}s (${w.moments.length} flagged) ━━━`);
+        setProg({ phase: 'yolo', message: `Phase 2: window ${i + 1}/${windows.length} (YOLO @ ${YOLO_WINDOW_FPS} FPS)...` });
 
-        // Phase 2: YOLO @ 3 FPS over the window — gives ~30 annotated frames for a 10s window
-        const detections = await yoloDetectSegment(videoFile, w.start, w.end, YOLO_WINDOW_FPS, msg => addLog('info', msg));
+        const detections = await yoloDetectSegment(videoFile, w.start, w.end, YOLO_WINDOW_FPS, currentInterpretation.target_objects, msg => addLog('info', msg));
 
-        // Phase 3: Gemini reasoning over all annotated frames + bbox metadata
-        const kfs = await geminiFinalReasoning(
+        setProg({ phase: 'reason', message: `Phase 3: window ${i + 1}/${windows.length} reasoning over ${detections.length} frames...` });
+        const incs = await geminiFinalReasoning(
           geminiApiKey,
           queryText,
+          currentInterpretation,
           w.start,
           w.end,
           w.moments,
@@ -853,35 +1176,33 @@ export default function App() {
           msg => addLog('info', msg)
         );
 
-        allKeyframes.push(...kfs);
+        allIncidents.push(...incs);
+        setProgress(prev => ({ ...prev, windowsDone: i + 1, incidentsFound: allIncidents.length }));
 
-        if (kfs.length > 0) {
-          addLog('success', `   🚨 Incident confirmed in window ${i + 1}.`);
+        if (incs.length > 0) {
+          addLog('success', `   🚨 ${incs.length} incident(s) confirmed in window ${i + 1}.`);
         }
       }
 
-      addLog('info', `\n✅ Pipeline complete. ${allKeyframes.length} keyframe(s) rendered.`);
-      const results = allKeyframes;
+      const sorted = allIncidents.sort((a, b) => a.timeSeconds - b.timeSeconds);
+      setIncidents(sorted);
+      setProg({ phase: 'done', message: `Done. ${sorted.length} incident(s) found.`, incidentsFound: sorted.length });
 
-      // Step 3: Process results
-      if (results.length === 0) {
-        addLog('warn', `No matches confirmed for "${queryText}" after verification.`);
+      if (sorted.length === 0) {
+        addLog('warn', `No incidents confirmed for "${queryText}" after deep analysis.`);
       } else {
-        setKeyframes(results.sort((a, b) => a.timeSeconds - b.timeSeconds));
-        results.forEach(kf => {
-          addLog('detect', `Match at ${formatVideoTime(kf.timeSeconds)}: "${kf.label}" — conf: ${(kf.confidence * 100).toFixed(1)}%`);
-        });
-        addLog('success', `⚡ Analysis complete. ${results.length} keyframe(s) found.`);
-
-        // Auto-jump to highest confidence
-        const best = results.reduce((a, b) => a.confidence > b.confidence ? a : b);
-        jumpToKeyframe(best);
-        addLog('info', `Auto-jumped to best match at ${formatVideoTime(best.timeSeconds)}.`);
+        addLog('success', `⚡ Analysis complete. ${sorted.length} incident(s) found.`);
+        // Auto-jump to first chronological incident — easier mental model than "highest confidence"
+        const first = sorted[0];
+        setActiveIncidentId(first.id);
+        seekTo(first.timeSeconds);
+        addLog('info', `Auto-jumped to first incident at ${formatVideoTime(first.timeSeconds)}.`);
       }
     } catch (err: any) {
       console.error('[Scamtir] Gemini API error:', err);
       const errMsg = err instanceof Error ? err.message : String(err);
       addLog('error', `API error: ${errMsg}`);
+      setProg({ phase: 'error', message: errMsg });
       if (errMsg.includes('401') || errMsg.includes('403')) {
         addLog('error', 'Invalid API key. Please re-enter your Gemini API key.');
         setShowApiKeyModal(true);
@@ -889,7 +1210,7 @@ export default function App() {
     } finally {
       setAnalyzing(false);
     }
-  }, [query, videoUrl, analyzing, videoDuration, addLog, queryHistory, jumpToKeyframe, geminiApiKey, pipelineOptimizedFile, pipelineGeminiUri, pipelineScreenedSegments, videoFile, scanStart, scanEnd]);
+  }, [query, videoUrl, analyzing, videoDuration, addLog, queryHistory, geminiApiKey, pipelineOptimizedFile, pipelineGeminiUri, pipelineScreenedSegments, pipelineInterpretation, videoFile, scanStart, scanEnd, seekTo]);
 
   const loadPreset = useCallback((preset: PresetQuery) => {
     setQuery(preset.query);
@@ -910,7 +1231,10 @@ export default function App() {
 
   const progressPct = videoDuration > 0 ? (currentTime / videoDuration) * 100 : 0;
 
-  const activeFrames = keyframes.filter(kf => currentTime >= kf.duration[0] && currentTime <= kf.duration[1]);
+  const visibleIncidents = incidents.filter(inc => inc.confidence >= confidenceFilter);
+  const activeIncidents = visibleIncidents.filter(inc => currentTime >= inc.duration[0] && currentTime <= inc.duration[1]);
+  const activeIncident = activeIncidents.find(i => i.id === activeIncidentId) || activeIncidents[0] || null;
+  const inspectIncident = inspectIncidentId != null ? incidents.find(i => i.id === inspectIncidentId) || null : null;
 
   return (
     <div className="app-layout">
@@ -932,8 +1256,8 @@ export default function App() {
               <span>{videoUrl ? (isPlaying ? 'Playing' : 'Loaded') : 'No Video'}</span>
             </div>
             <div className="status-indicator" style={{ marginLeft: 12 }}>
-              <div className={`status-dot ${keyframes.length > 0 ? '' : 'inactive'}`} />
-              <span>{keyframes.length} Keyframe{keyframes.length !== 1 ? 's' : ''}</span>
+              <div className={`status-dot ${visibleIncidents.length > 0 ? '' : 'inactive'}`} />
+              <span>{visibleIncidents.length} Incident{visibleIncidents.length !== 1 ? 's' : ''}</span>
             </div>
           </div>
         </div>
@@ -941,7 +1265,7 @@ export default function App() {
         {/* Video View */}
         <div className="viewport-body">
           {videoUrl ? (
-            <div className="video-wrapper" style={{ '--video-aspect': videoDim.w && videoDim.h ? `${videoDim.w} / ${videoDim.h}` : '16/9' } as React.CSSProperties}>
+            <div ref={videoWrapperRef} className="video-wrapper" style={{ '--video-aspect': videoDim.w && videoDim.h ? `${videoDim.w} / ${videoDim.h}` : '16/9' } as React.CSSProperties}>
               <video
                 ref={videoRef}
                 src={videoUrl}
@@ -958,39 +1282,63 @@ export default function App() {
                   <div className="scan-line" />
                   <div className="analyzing-text">
                     <IconGemini />
-                    <span>Gemini is analyzing video segments...</span>
+                    <span>{progress.message}</span>
                   </div>
                 </div>
               )}
-              {/* Bounding Box Overlays */}
-              {videoDim.w > 0 && activeFrames.map(kf => {
-                if (!kf.boundingBox) return null;
-                const [ymin, xmin, ymax, xmax] = kf.boundingBox;
-                const top = `${(ymin / 1000) * 100}%`;
-                const left = `${(xmin / 1000) * 100}%`;
-                const width = `${((xmax - xmin) / 1000) * 100}%`;
-                const height = `${((ymax - ymin) / 1000) * 100}%`;
-                return (
-                  <div
-                    key={`bbox-${kf.id}`}
-                    className="bounding-box-overlay"
-                    style={{ top, left, width, height, '--bbox-color': kf.color } as React.CSSProperties}
-                  >
-                    <div className="bbox-label" style={{ background: kf.color }}>{kf.label}</div>
-                    <div className="bbox-corner top-left" />
-                    <div className="bbox-corner top-right" />
-                    <div className="bbox-corner bottom-left" />
-                    <div className="bbox-corner bottom-right" />
-                  </div>
-                );
-              })}
-              {/* Active keyframe indicator */}
-              {activeKeyframe && (
-                <div className="active-keyframe-badge">
-                  <span className="akf-dot" style={{ background: activeKeyframe.color }} />
-                  <span className="akf-label">{activeKeyframe.label}</span>
-                  <span className="akf-conf">{(activeKeyframe.confidence * 100).toFixed(0)}%</span>
-                  <span className="akf-time">{formatVideoTime(activeKeyframe.timeSeconds)}</span>
+              {/* Bounding box layer — exactly the rendered video pixels (letterbox/pillarbox aware) */}
+              {videoFitRect.width > 0 && (
+                <div
+                  className="bbox-layer"
+                  style={{
+                    position: 'absolute',
+                    left: `${videoFitRect.left}px`,
+                    top: `${videoFitRect.top}px`,
+                    width: `${videoFitRect.width}px`,
+                    height: `${videoFitRect.height}px`,
+                    pointerEvents: 'none',
+                    zIndex: 5,
+                  }}
+                >
+                  {activeIncidents.flatMap(inc =>
+                    inc.involved.map((obj, i) => {
+                      const [ymin, xmin, ymax, xmax] = obj.bbox;
+                      const top = `${(ymin / 1000) * 100}%`;
+                      const left = `${(xmin / 1000) * 100}%`;
+                      const width = `${((xmax - xmin) / 1000) * 100}%`;
+                      const height = `${((ymax - ymin) / 1000) * 100}%`;
+                      const isActive = inc.id === (activeIncident?.id ?? -1);
+                      return (
+                        <div
+                          key={`bbox-${inc.id}-${i}`}
+                          className={`bounding-box-overlay ${isActive ? 'is-active' : ''}`}
+                          style={{ top, left, width, height, '--bbox-color': inc.color } as React.CSSProperties}
+                          title={`${obj.role} (${obj.label} ${(obj.yoloConfidence * 100).toFixed(0)}%) — ${inc.eventType}`}
+                        >
+                          <div className="bbox-label" style={{ background: inc.color }}>
+                            <span className="bbl-role">{obj.role}</span>
+                            <span className="bbl-class">{obj.label}</span>
+                          </div>
+                          <div className="bbox-corner top-left" />
+                          <div className="bbox-corner top-right" />
+                          <div className="bbox-corner bottom-left" />
+                          <div className="bbox-corner bottom-right" />
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              )}
+              {/* Active incident badge */}
+              {activeIncident && (
+                <div className="active-keyframe-badge" onClick={() => openInspector(activeIncident)} style={{ cursor: 'pointer' }} title="Click for processing details">
+                  <span className="akf-dot" style={{ background: activeIncident.color }} />
+                  <span className="akf-label">
+                    <strong style={{ marginRight: 6 }}>{activeIncident.eventType}</strong>
+                    {activeIncident.description}
+                  </span>
+                  <span className="akf-conf">{(activeIncident.confidence * 100).toFixed(0)}%</span>
+                  <span className="akf-time">{formatVideoTime(activeIncident.timeSeconds)}</span>
                 </div>
               )}
               {/* Play/Pause overlay */}
@@ -1016,29 +1364,28 @@ export default function App() {
           <div className="timeline-track-wrapper" ref={timelineRef} onClick={handleTimelineClick}>
             <div className="timeline-track">
               <div className="timeline-progress" style={{ width: `${progressPct}%` }} />
-              {/* Keyframe ranges */}
-              {keyframes.map(kf => {
-                const startPct = videoDuration > 0 ? (kf.duration[0] / videoDuration) * 100 : 0;
-                const widthPct = videoDuration > 0 ? ((kf.duration[1] - kf.duration[0]) / videoDuration) * 100 : 0;
+              {/* One range + one marker per incident (no more N stacked duplicates) */}
+              {visibleIncidents.map(inc => {
+                const startPct = videoDuration > 0 ? (inc.duration[0] / videoDuration) * 100 : 0;
+                const widthPct = videoDuration > 0 ? ((inc.duration[1] - inc.duration[0]) / videoDuration) * 100 : 0;
                 return (
                   <div
-                    key={`range-${kf.id}`}
-                    className={`keyframe-range ${activeFrames.some(a => a.id === kf.id) ? 'active' : ''}`}
-                    style={{ left: `${startPct}%`, width: `${widthPct}%`, '--kf-color': kf.color } as React.CSSProperties}
+                    key={`range-${inc.id}`}
+                    className={`keyframe-range ${activeIncidents.some(a => a.id === inc.id) ? 'active' : ''}`}
+                    style={{ left: `${startPct}%`, width: `${widthPct}%`, '--kf-color': inc.color } as React.CSSProperties}
                   />
                 );
               })}
-              {/* Keyframe markers */}
-              {keyframes.map(kf => {
-                const pct = videoDuration > 0 ? (kf.timeSeconds / videoDuration) * 100 : 0;
-                const isActive = activeFrames.some(a => a.id === kf.id);
+              {visibleIncidents.map(inc => {
+                const pct = videoDuration > 0 ? (inc.timeSeconds / videoDuration) * 100 : 0;
+                const isActive = activeIncidents.some(a => a.id === inc.id);
                 return (
                   <button
-                    key={`marker-${kf.id}`}
+                    key={`marker-${inc.id}`}
                     className={`keyframe-marker ${isActive ? 'active' : ''}`}
-                    style={{ left: `${pct}%`, '--kf-color': kf.color } as React.CSSProperties}
-                    onClick={e => { e.stopPropagation(); jumpToKeyframe(kf); }}
-                    title={`${formatVideoTime(kf.duration[0])} - ${formatVideoTime(kf.duration[1])} \u2014 ${kf.label} (${(kf.confidence * 100).toFixed(0)}%)`}
+                    style={{ left: `${pct}%`, '--kf-color': inc.color } as React.CSSProperties}
+                    onClick={e => { e.stopPropagation(); jumpToIncident(inc); }}
+                    title={`${formatVideoTime(inc.timeSeconds)} \u2014 ${inc.eventType}: ${inc.description} (${(inc.confidence * 100).toFixed(0)}%, ${inc.involved.length} involved)`}
                   >
                     <span className="keyframe-pulse" />
                   </button>
@@ -1051,20 +1398,28 @@ export default function App() {
           <div className="timeline-time">{formatVideoTime(videoDuration)}</div>
         </div>
 
-        {/* Keyframe chips row */}
-        {keyframes.length > 0 && (
+        {/* Incident chips row — one per real event, with type + parties + click-to-inspect */}
+        {visibleIncidents.length > 0 && (
           <div className="keyframe-chips">
-            {keyframes.map(kf => (
-              <button
-                key={kf.id}
-                className={`keyframe-chip ${activeKeyframe?.id === kf.id ? 'active' : ''}`}
-                style={{ '--kf-color': kf.color } as React.CSSProperties}
-                onClick={() => jumpToKeyframe(kf)}
+            {visibleIncidents.map(inc => (
+              <div
+                key={inc.id}
+                className={`keyframe-chip ${activeIncidentId === inc.id ? 'active' : ''}`}
+                style={{ '--kf-color': inc.color } as React.CSSProperties}
               >
-                <span className="kc-dot" style={{ background: kf.color }} />
-                <span className="kc-time">{formatVideoTime(kf.timeSeconds)}</span>
-                <span className="kc-conf">{(kf.confidence * 100).toFixed(0)}%</span>
-              </button>
+                <button className="kc-main" onClick={() => jumpToIncident(inc)} title="Jump to incident">
+                  <span className="kc-dot" style={{ background: inc.color }} />
+                  <span className="kc-time">{formatVideoTime(inc.timeSeconds)}</span>
+                  <span className="kc-event">{inc.eventType}</span>
+                  <span className="kc-parties">{inc.involved.length}p</span>
+                  <span className="kc-conf">{(inc.confidence * 100).toFixed(0)}%</span>
+                </button>
+                <button className="kc-inspect" onClick={() => openInspector(inc)} title="Show pipeline trace">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="9" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+                  </svg>
+                </button>
+              </div>
             ))}
           </div>
         )}
@@ -1081,12 +1436,12 @@ export default function App() {
               <span className="stat-value">{videoDuration > 0 ? formatVideoTime(videoDuration) : '—'}</span>
             </div>
             <div className="stat-item">
-              <span className="stat-label">KEYFRAMES</span>
-              <span className="stat-value">{keyframes.length}</span>
+              <span className="stat-label">INCIDENTS</span>
+              <span className="stat-value">{visibleIncidents.length}</span>
             </div>
           </div>
           <div className="viewport-fps">
-            {analyzing ? '⏳ Analyzing...' : keyframes.length > 0 ? '✅ Ready' : '— Idle'}
+            {analyzing ? `⏳ ${progress.message}` : visibleIncidents.length > 0 ? '✅ Ready' : '— Idle'}
           </div>
         </div>
       </div>
@@ -1216,21 +1571,23 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Row 2: Advanced Settings */}
+              {/* Row 2: Confidence Threshold (filters incidents post-analysis) */}
               <div>
                 <label style={{ fontSize: '12px', color: '#888', marginBottom: '8px', display: 'flex', justifyContent: 'space-between' }}>
-                  <span>YOLO Annotator Precision</span>
-                  <span style={{ color: '#fff', fontWeight: 'bold' }}>{yoloFps} FPS</span>
+                  <span>Confidence Filter</span>
+                  <span style={{ color: '#fff', fontWeight: 'bold' }}>{(confidenceFilter * 100).toFixed(0)}%</span>
                 </label>
                 <input
                   type="range"
-                  min="1"
-                  max="30"
-                  value={yoloFps}
-                  onChange={e => setYoloFps(parseInt(e.target.value) || 5)}
+                  min="0"
+                  max="100"
+                  value={Math.round(confidenceFilter * 100)}
+                  onChange={e => setConfidenceFilter((parseInt(e.target.value) || 0) / 100)}
                   style={{ width: '100%', cursor: 'pointer', marginBottom: '4px' }}
                 />
-                <div style={{ fontSize: '10px', color: '#555' }}>Higher FPS = Better spatial reasoning, but slower processing.</div>
+                <div style={{ fontSize: '10px', color: '#555' }}>
+                  Hide incidents below this confidence ({incidents.length - visibleIncidents.length} hidden / {incidents.length} total).
+                </div>
               </div>
             </div>
           </div>
@@ -1244,16 +1601,52 @@ export default function App() {
             {analyzing ? (
               <>
                 <div className="spinner" />
-                Running Pipeline...
+                {progress.message}
               </>
             ) : (
               <>
                 <IconGemini />
-                Start Gemini-Optimized Pipeline
-
+                Run Multi-Phase Analysis
               </>
             )}
           </button>
+
+          {/* Pipeline Progress Panel — visible while analyzing or when last run produced results */}
+          {(analyzing || progress.phase === 'done' || progress.phase === 'error') && (
+            <div className="pipeline-panel">
+              <div className="pp-header">
+                <span className="pp-title">Pipeline Status</span>
+                <span className={`pp-phase pp-phase-${progress.phase}`}>{progress.phase.toUpperCase()}</span>
+              </div>
+              <div className="pp-message">{progress.message}</div>
+              <div className="pp-steps">
+                <div className={`pp-step ${['screen','yolo','reason','done'].includes(progress.phase) ? 'done' : progress.phase === 'compress' || progress.phase === 'upload' ? 'active' : ''}`}>
+                  <span className="pp-step-num">1</span>
+                  <span className="pp-step-name">Upload</span>
+                  <span className="pp-step-detail">{progress.phase === 'compress' ? 'compressing' : progress.phase === 'upload' ? 'uploading' : ''}</span>
+                </div>
+                <div className={`pp-step ${['yolo','reason','done'].includes(progress.phase) ? 'done' : progress.phase === 'screen' ? 'active' : ''}`}>
+                  <span className="pp-step-num">2</span>
+                  <span className="pp-step-name">Screen</span>
+                  <span className="pp-step-detail">{progress.batchesTotal > 0 ? `${progress.batchesDone}/${progress.batchesTotal} batches` : ''}</span>
+                </div>
+                <div className={`pp-step ${['done'].includes(progress.phase) ? 'done' : (progress.phase === 'yolo' || progress.phase === 'reason') ? 'active' : ''}`}>
+                  <span className="pp-step-num">3</span>
+                  <span className="pp-step-name">YOLO + Reason</span>
+                  <span className="pp-step-detail">{progress.windowsTotal > 0 ? `${progress.windowsDone}/${progress.windowsTotal} windows` : ''}</span>
+                </div>
+              </div>
+              {progress.windowsTotal > 0 && (
+                <div className="pp-bar">
+                  <div className="pp-bar-fill" style={{ width: `${(progress.windowsDone / progress.windowsTotal) * 100}%` }} />
+                </div>
+              )}
+              <div className="pp-tail">
+                <span>Incidents found: <strong>{progress.incidentsFound}</strong></span>
+                {progress.phase === 'error' && <span style={{ color: 'var(--accent-red)' }}>· error</span>}
+              </div>
+            </div>
+          )}
 
           {/* Query History */}
           {queryHistory.length > 0 && (
@@ -1402,6 +1795,110 @@ export default function App() {
                 disabled={!apiKeyInput.trim()}
               >
                 Save Key
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ===== INCIDENT INSPECTOR MODAL =====
+          Click an incident chip (or the active badge) to see exactly what the pipeline saw and decided. */}
+      {inspectIncident && (
+        <div className="modal-overlay" onClick={closeInspector}>
+          <div className="modal-card inspector-card" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="modal-icon" style={{ background: inspectIncident.color }}>
+                <IconGemini />
+              </div>
+              <div style={{ flex: 1 }}>
+                <h3 className="modal-title">
+                  {inspectIncident.eventType}
+                  <span style={{ marginLeft: 10, fontSize: '12px', color: 'var(--text-secondary)' }}>
+                    @ {formatVideoTime(inspectIncident.timeSeconds)} · severity {inspectIncident.severity} · {(inspectIncident.confidence * 100).toFixed(0)}%
+                  </span>
+                </h3>
+                <p className="modal-subtitle">{inspectIncident.description}</p>
+              </div>
+              <button className="modal-btn-secondary" onClick={closeInspector}>Close</button>
+            </div>
+
+            <div className="modal-body inspector-body">
+              {/* Section: Query */}
+              <div className="insp-section">
+                <div className="insp-section-title">Query Sent</div>
+                <code className="insp-query">"{inspectIncident.trace.query}"</code>
+              </div>
+
+              {/* Section: Phase 1 — flagged moments */}
+              <div className="insp-section">
+                <div className="insp-section-title">
+                  Phase 1 · Coarse Screen — flagged moments inside window {inspectIncident.trace.windowStart.toFixed(1)}s..{inspectIncident.trace.windowEnd.toFixed(1)}s
+                </div>
+                {inspectIncident.trace.flaggedMoments.length === 0 ? (
+                  <div className="insp-empty">No flagged moments recorded for this window.</div>
+                ) : (
+                  <ul className="insp-list">
+                    {inspectIncident.trace.flaggedMoments.map((m, i) => (
+                      <li key={i}>
+                        <strong>{m.flagged_sec.toFixed(1)}s</strong>
+                        <span className="insp-conf">{(m.confidence * 100).toFixed(0)}%</span>
+                        <span className="insp-text">{m.description}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+
+              {/* Section: Phase 2 — YOLO frames */}
+              <div className="insp-section">
+                <div className="insp-section-title">
+                  Phase 2 · YOLO @ {YOLO_WINDOW_FPS} FPS — {inspectIncident.trace.yoloFrames.length} frame(s) sent to Gemini
+                </div>
+                <div className="insp-thumb-strip">
+                  {inspectIncident.trace.yoloFrames.map((f, i) => (
+                    <div key={i} className="insp-thumb" title={`${f.frameSec.toFixed(2)}s · ${f.objects.length} object(s)`}>
+                      <img src={`data:image/jpeg;base64,${f.annotatedB64}`} alt={`frame ${i}`} />
+                      <div className="insp-thumb-meta">
+                        <span>{f.frameSec.toFixed(1)}s</span>
+                        <span>{f.objects.length}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Section: Phase 3 — involved objects */}
+              <div className="insp-section">
+                <div className="insp-section-title">Phase 3 · Final Reasoning — Gemini's verdict</div>
+                {inspectIncident.involved.length === 0 ? (
+                  <div className="insp-empty">No specific objects were attributed to this incident.</div>
+                ) : (
+                  <ul className="insp-list insp-involved">
+                    {inspectIncident.involved.map((obj, i) => (
+                      <li key={i}>
+                        <span className="insp-role" style={{ background: inspectIncident.color }}>{obj.role}</span>
+                        <span className="insp-class">{obj.label}</span>
+                        <span className="insp-conf">YOLO {(obj.yoloConfidence * 100).toFixed(0)}%</span>
+                        <span className="insp-bbox">bbox [{obj.bbox.map(n => Math.round(n)).join(', ')}]</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+
+              {/* Section: Raw response */}
+              <details className="insp-section">
+                <summary className="insp-section-title" style={{ cursor: 'pointer' }}>Raw Gemini response (JSON)</summary>
+                <pre className="insp-raw">{(() => {
+                  try { return JSON.stringify(JSON.parse(inspectIncident.trace.rawGeminiResponse), null, 2); }
+                  catch { return inspectIncident.trace.rawGeminiResponse; }
+                })()}</pre>
+              </details>
+            </div>
+
+            <div className="modal-actions">
+              <button className="modal-btn-primary" onClick={() => { jumpToIncident(inspectIncident); closeInspector(); }}>
+                Jump to Moment
               </button>
             </div>
           </div>
