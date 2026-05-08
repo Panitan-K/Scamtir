@@ -241,6 +241,7 @@ async function uploadVideoToGemini(apiKey: string, videoFile: File, onLog: (msg:
 // ===== PIPELINE CONSTANTS =====
 const BATCH_SIZE_SEC = 8;          // Phase 1: screening batch length (transformers handle short clips better)
 const PADDING_SEC = 5;             // Phase 2: ±5s window around each flagged second
+const MAX_WINDOW_SEC = 10;         // Phase 2: hard cap on a single YOLO window — splits into chunks beyond this
 const SCREEN_CONCURRENCY = 4;      // Max parallel Gemini screening calls
 const YOLO_WINDOW_FPS = 3;         // Phase 2: 3 FPS × 10s = 30 annotated frames
 
@@ -411,27 +412,61 @@ If nothing in this clip matches, return [].`;
   return results;
 }
 
-// Helper: merge nearby flagged seconds into ±padSec windows so YOLO doesn't redo overlapping work
+// Helper: merge nearby flagged seconds into ±padSec windows so YOLO doesn't redo overlapping work,
+// but HARD-CAP every window at maxLenSec — past that, split into back-to-back chunks so each YOLO
+// call processes ≤ maxLenSec of footage and the frontend can stream incidents window-by-window.
 function buildMergedWindows(
   moments: FlaggedMoment[],
   padSec: number,
-  videoDurationSec: number
+  videoDurationSec: number,
+  maxLenSec: number = MAX_WINDOW_SEC
 ): Array<{ start: number; end: number; moments: FlaggedMoment[] }> {
   if (moments.length === 0) return [];
   const sorted = [...moments].sort((a, b) => a.flagged_sec - b.flagged_sec);
-  const windows: Array<{ start: number; end: number; moments: FlaggedMoment[] }> = [];
+
+  // Step 1: greedy merge of overlapping ±padSec windows.
+  type Win = { start: number; end: number; moments: FlaggedMoment[] };
+  const merged: Win[] = [];
   for (const m of sorted) {
     const s = Math.max(0, m.flagged_sec - padSec);
     const e = Math.min(videoDurationSec, m.flagged_sec + padSec);
-    const last = windows[windows.length - 1];
+    const last = merged[merged.length - 1];
     if (last && s <= last.end) {
       last.end = Math.max(last.end, e);
       last.moments.push(m);
     } else {
-      windows.push({ start: s, end: e, moments: [m] });
+      merged.push({ start: s, end: e, moments: [m] });
     }
   }
-  return windows;
+
+  // Step 2: split any window longer than maxLenSec into consecutive maxLenSec chunks.
+  // Each chunk inherits the moments that fall inside its range; chunks with no moment
+  // inside still inherit the closest one so phase1Fallback has something to anchor on.
+  const out: Win[] = [];
+  for (const w of merged) {
+    const span = w.end - w.start;
+    if (span <= maxLenSec) {
+      out.push(w);
+      continue;
+    }
+    const chunkCount = Math.ceil(span / maxLenSec);
+    const chunkLen = span / chunkCount;
+    for (let i = 0; i < chunkCount; i++) {
+      const cStart = w.start + i * chunkLen;
+      const cEnd = i === chunkCount - 1 ? w.end : cStart + chunkLen;
+      const inRange = w.moments.filter(m => m.flagged_sec >= cStart && m.flagged_sec <= cEnd);
+      // If no moment falls in this chunk's range, anchor it to the nearest moment so Phase 3
+      // still has Phase 1 context (the merged window came from somewhere — the chunk just
+      // happens to be the surrounding padding).
+      const anchored = inRange.length > 0
+        ? inRange
+        : [w.moments.reduce((a, b) =>
+            Math.abs(a.flagged_sec - (cStart + chunkLen / 2)) < Math.abs(b.flagged_sec - (cStart + chunkLen / 2)) ? a : b
+          )];
+      out.push({ start: cStart, end: cEnd, moments: anchored });
+    }
+  }
+  return out;
 }
 
 // Step 2: YOLO Detection — send flagged segments to YOLO backend for object annotation
@@ -1151,15 +1186,16 @@ export default function App() {
         return;
       }
 
-      // Phase 2: Build merged ±5s windows
-      const windows = buildMergedWindows(filteredMoments, PADDING_SEC, videoDuration);
-      setProg({ phase: 'yolo', message: `Phase 2: YOLO over ${windows.length} window(s)...`, windowsTotal: windows.length, windowsDone: 0 });
-      addLog('info', `📌 Phase 2: ${windows.length} merged window(s) (${PADDING_SEC}s padding, deduped) for YOLO annotation.`);
+      // Phase 2: Build merged ±5s windows, hard-capped at MAX_WINDOW_SEC so each YOLO call is bounded.
+      const windows = buildMergedWindows(filteredMoments, PADDING_SEC, videoDuration, MAX_WINDOW_SEC);
+      setProg({ phase: 'yolo', message: `Phase 2: YOLO over ${windows.length} window(s) (≤${MAX_WINDOW_SEC}s each)...`, windowsTotal: windows.length, windowsDone: 0 });
+      addLog('info', `📌 Phase 2: ${windows.length} window(s) (${PADDING_SEC}s padding, capped at ${MAX_WINDOW_SEC}s each) for YOLO annotation.`);
 
       const allIncidents: Incident[] = [];
+      let firstAutoJumped = false;
       for (let i = 0; i < windows.length; i++) {
         const w = windows[i];
-        addLog('info', `━━━ Window ${i + 1}/${windows.length}: ${w.start.toFixed(1)}s-${w.end.toFixed(1)}s (${w.moments.length} flagged) ━━━`);
+        addLog('info', `━━━ Window ${i + 1}/${windows.length}: ${w.start.toFixed(1)}s-${w.end.toFixed(1)}s (${(w.end - w.start).toFixed(1)}s, ${w.moments.length} flagged) ━━━`);
         setProg({ phase: 'yolo', message: `Phase 2: window ${i + 1}/${windows.length} (YOLO @ ${YOLO_WINDOW_FPS} FPS)...` });
 
         const detections = await yoloDetectSegment(videoFile, w.start, w.end, YOLO_WINDOW_FPS, currentInterpretation.target_objects, msg => addLog('info', msg));
@@ -1176,27 +1212,32 @@ export default function App() {
           msg => addLog('info', msg)
         );
 
-        allIncidents.push(...incs);
-        setProgress(prev => ({ ...prev, windowsDone: i + 1, incidentsFound: allIncidents.length }));
-
+        // FIFO streaming: render each window's incidents immediately so the user sees progress
+        // and can start inspecting / jumping while later windows are still processing.
         if (incs.length > 0) {
-          addLog('success', `   🚨 ${incs.length} incident(s) confirmed in window ${i + 1}.`);
+          allIncidents.push(...incs);
+          const sortedSoFar = [...allIncidents].sort((a, b) => a.timeSeconds - b.timeSeconds);
+          setIncidents(sortedSoFar);
+          addLog('success', `   🚨 ${incs.length} incident(s) confirmed in window ${i + 1} — rendered to timeline.`);
+
+          // Auto-jump to the very first incident the moment it lands (don't wait for all windows).
+          if (!firstAutoJumped) {
+            const first = sortedSoFar[0];
+            setActiveIncidentId(first.id);
+            seekTo(first.timeSeconds);
+            addLog('info', `Auto-jumped to first incident at ${formatVideoTime(first.timeSeconds)}.`);
+            firstAutoJumped = true;
+          }
         }
+        setProgress(prev => ({ ...prev, windowsDone: i + 1, incidentsFound: allIncidents.length }));
       }
 
-      const sorted = allIncidents.sort((a, b) => a.timeSeconds - b.timeSeconds);
-      setIncidents(sorted);
-      setProg({ phase: 'done', message: `Done. ${sorted.length} incident(s) found.`, incidentsFound: sorted.length });
+      setProg({ phase: 'done', message: `Done. ${allIncidents.length} incident(s) found.`, incidentsFound: allIncidents.length });
 
-      if (sorted.length === 0) {
+      if (allIncidents.length === 0) {
         addLog('warn', `No incidents confirmed for "${queryText}" after deep analysis.`);
       } else {
-        addLog('success', `⚡ Analysis complete. ${sorted.length} incident(s) found.`);
-        // Auto-jump to first chronological incident — easier mental model than "highest confidence"
-        const first = sorted[0];
-        setActiveIncidentId(first.id);
-        seekTo(first.timeSeconds);
-        addLog('info', `Auto-jumped to first incident at ${formatVideoTime(first.timeSeconds)}.`);
+        addLog('success', `⚡ Analysis complete. ${allIncidents.length} incident(s) found.`);
       }
     } catch (err: any) {
       console.error('[Scamtir] Gemini API error:', err);
