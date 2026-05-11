@@ -7,19 +7,19 @@
   --bg-card: #1a2235;
   --bg-elevated: #1e2740;
   --bg-input: #0d1220;
-  
+
   /* Borders */
   --border-subtle: rgba(99, 115, 146, 0.15);
   --border-default: rgba(99, 115, 146, 0.25);
   --border-hover: rgba(99, 115, 146, 0.4);
   --border-active: rgba(129, 140, 248, 0.5);
-  
+
   /* Text */
   --text-primary: #e8ecf4;
   --text-secondary: #8b95a8;
   --text-muted: #5a6478;
   --text-accent: #818cf8;
-  
+
   /* Accent Colors */
   --accent-indigo: #818cf8;
   --accent-indigo-dim: rgba(129, 140, 248, 0.15);
@@ -45,17 +45,17 @@
   --gradient-scamtir: linear-gradient(135deg, #4285f4, #a78bfa, #c084fc);
   --gradient-glow: radial-gradient(ellipse at 50% 0%, rgba(129, 140, 248, 0.12) 0%, transparent 60%);
   --gradient-timeline: linear-gradient(90deg, rgba(56, 189, 248, 0.05), rgba(129, 140, 248, 0.08), rgba(192, 132, 252, 0.05));
-  
+
   /* Spacing */
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 16px;
   --radius-xl: 20px;
-  
+
   /* Fonts */
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
-  
+
   /* Shadows */
   --shadow-sm: 0 1px 3px rgba(0,0,0,0.3);
   --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
