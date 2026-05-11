@@ -4,7 +4,100 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import './App.css';
 
 const ENV_API_KEY = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined)?.trim();
-const GEMINI_MODEL = 'gemini-3-flash-preview';
+
+// ===== GEMINI MODEL FALLBACK CHAIN =====
+// Ordered by preference. On HTTP 429 (rate limit), the caller automatically rotates to the next model.
+// Flash variants are preferred (faster, higher RPM); Pro is the last resort (slower, lower RPM but separate quota).
+const GEMINI_MODELS = [
+  'gemini-3-flash-preview',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+] as const;
+
+const MODEL_DISPLAY_NAMES: Record<string, string> = {
+  'gemini-3-flash-preview': 'Scamtir Model 1',
+  'gemini-2.5-flash': 'Scamtir Model 2',
+  'gemini-2.0-flash': 'Scamtir Model 3',
+};
+const getModelName = (m: string) => MODEL_DISPLAY_NAMES[m] || m;
+
+// Session-level state: start from the first model; on 429 rotate forward.
+// This persists across pipeline phases within one page session so the next call
+// immediately uses whichever model last succeeded instead of hitting the exhausted one again.
+let _geminiModelIdx = 0;
+const _modelCooldowns = new Map<string, number>();   // model → Date.now() when cooldown expires
+const MODEL_COOLDOWN_MS = 15_000;                    // skip a 429’d model for 15 s before retrying it
+
+/**
+ * Central Gemini API caller with automatic model fallback on 429.
+ * Tries each model in the fallback chain starting from the last successful one.
+ * Returns the parsed JSON response body on success.
+ * Throws on non-429 HTTP errors or if ALL models are exhausted.
+ */
+async function geminiCall(
+  apiKey: string,
+  body: object,
+  onLog?: (msg: string) => void,
+): Promise<any> {
+  const now = Date.now();
+
+  // Build attempt order: start from last-successful model, wrap around, skip cooled-down models.
+  const attempts: (typeof GEMINI_MODELS[number])[] = [];
+  for (let i = 0; i < GEMINI_MODELS.length; i++) {
+    const idx = ((_geminiModelIdx + i) % GEMINI_MODELS.length);
+    const model = GEMINI_MODELS[idx];
+    const until = _modelCooldowns.get(model) ?? 0;
+    if (until > now) continue;              // still cooling down — skip this pass
+    attempts.push(model);
+  }
+  // If every model is on cooldown, try them all anyway (cooldowns are approximate)
+  if (attempts.length === 0) {
+    for (let i = 0; i < GEMINI_MODELS.length; i++) {
+      attempts.push(GEMINI_MODELS[(_geminiModelIdx + i) % GEMINI_MODELS.length]);
+    }
+    onLog?.(`   ⚠️ All models on cooldown — retrying from ${getModelName(attempts[0])}...`);
+  }
+
+  let lastErr: Error | null = null;
+  for (const model of attempts) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey.trim()}`;
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      // Network / fetch-level error (not HTTP) — propagate immediately, no fallback
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+
+    if (res.status === 429) {
+      _modelCooldowns.set(model, Date.now() + MODEL_COOLDOWN_MS);
+      onLog?.(`   ⚠️ ${getModelName(model)} rate-limited (429) — rotating to next model...`);
+      lastErr = new Error(`429 rate-limited on ${getModelName(model)}`);
+      continue;
+    }
+
+    if (!res.ok) {
+      // Non-429 HTTP error — propagate immediately (auth errors, bad request, etc.)
+      const errText = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} from ${getModelName(model)}: ${errText}`);
+    }
+
+    // ✅ Success — lock onto this model for subsequent calls
+    const newIdx = GEMINI_MODELS.indexOf(model);
+    if (newIdx !== _geminiModelIdx) {
+      onLog?.(`   🔄 Switched to fallback model: ${getModelName(model)}`);
+      _geminiModelIdx = newIdx;
+    }
+    return await res.json();
+  }
+
+  // Every model returned 429
+  throw lastErr ?? new Error('All Scamtir models exhausted (429 rate-limited)');
+}
 
 // ===== TYPES =====
 interface LogEntry {
@@ -196,7 +289,7 @@ async function uploadVideoToGemini(apiKey: string, videoFile: File, onLog: (msg:
   // Compress before upload!
   const optimizedFile = await compressVideoClientSide(videoFile, onLog);
 
-  onLog(`Uploading ${optimizedFile.name} (${(optimizedFile.size / 1024 / 1024).toFixed(1)}MB) via Gemini File API...`);
+  onLog(`Uploading ${optimizedFile.name} (${(optimizedFile.size / 1024 / 1024).toFixed(1)}MB) to Scamtir...`);
   const uploadRes = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey.trim()}`, {
     method: 'POST',
     headers: {
@@ -234,16 +327,16 @@ async function uploadVideoToGemini(apiKey: string, videoFile: File, onLog: (msg:
     throw new Error("Video processing failed on Google's servers.");
   }
 
-  onLog('✅ Video is ACTIVE on Gemini.');
+  onLog('✅ Video is ACTIVE on Scamtir.');
   return { fileUri, mimeType: fileInfo.file.mimeType, fileName };
 }
 
 // ===== PIPELINE CONSTANTS =====
 const BATCH_SIZE_SEC = 8;          // Phase 1: screening batch length (transformers handle short clips better)
-const PADDING_SEC = 5;             // Phase 2: ±5s window around each flagged second
+const PADDING_SEC = 2.5;           // Phase 2: ±2.5s window around each flagged second
 const MAX_WINDOW_SEC = 10;         // Phase 2: hard cap on a single YOLO window — splits into chunks beyond this
-const SCREEN_CONCURRENCY = 4;      // Max parallel Gemini screening calls
-const YOLO_WINDOW_FPS = 3;         // Phase 2: 3 FPS × 10s = 30 annotated frames
+const SCREEN_CONCURRENCY = 2;      // Max parallel Scamtir screening calls (keep low to avoid 429 storms)
+const YOLO_WINDOW_FPS = 2;         // Phase 2: 2 FPS × 10s = 20 annotated frames
 
 interface FlaggedMoment {
   flagged_sec: number;
@@ -283,16 +376,10 @@ Return ONLY a JSON object:
 Query: "${query}"`;
 
   try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 0.2 }
-      })
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await geminiCall(apiKey, {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.2 }
+    }, onLog);
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
     const parsed = JSON.parse(text) || {};
     const interp: QueryInterpretation = {
@@ -356,30 +443,21 @@ If nothing in this clip matches, return [].`;
 
   async function screenOne(batch: { start: number; end: number }): Promise<FlaggedMoment[]> {
     try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              {
-                fileData: { fileUri, mimeType },
-                videoMetadata: {
-                  startOffset: `${batch.start}s`,
-                  endOffset: `${batch.end}s`
-                }
-              },
-              { text: screenPrompt }
-            ]
-          }],
-          generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
-        })
-      });
-      if (!res.ok) {
-        onLog(`   ⚠️ Batch ${batch.start}-${batch.end}s screen failed: ${res.status}`);
-        return [];
-      }
-      const data = await res.json();
+      const data = await geminiCall(apiKey, {
+        contents: [{
+          parts: [
+            {
+              fileData: { fileUri, mimeType },
+              videoMetadata: {
+                startOffset: `${batch.start}s`,
+                endOffset: `${batch.end}s`
+              }
+            },
+            { text: screenPrompt }
+          ]
+        }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
+      }, onLog);
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
       const arr: any[] = JSON.parse(text);
       const moments = arr
@@ -461,8 +539,8 @@ function buildMergedWindows(
       const anchored = inRange.length > 0
         ? inRange
         : [w.moments.reduce((a, b) =>
-            Math.abs(a.flagged_sec - (cStart + chunkLen / 2)) < Math.abs(b.flagged_sec - (cStart + chunkLen / 2)) ? a : b
-          )];
+          Math.abs(a.flagged_sec - (cStart + chunkLen / 2)) < Math.abs(b.flagged_sec - (cStart + chunkLen / 2)) ? a : b
+        )];
       out.push({ start: cStart, end: cEnd, moments: anchored });
     }
   }
@@ -522,7 +600,7 @@ function sampleEvenly<T>(arr: T[], n: number): T[] {
   return out;
 }
 
-const REASONING_FRAME_BUDGET = 14;
+const REASONING_FRAME_BUDGET = 10;
 
 // Step 3: Gemini Final Reasoning — Phase 1 has already CONFIRMED the incident. Phase 3's job is to
 // LOCATE the peak frame and identify involved parties — NOT to re-litigate whether it happened.
@@ -569,7 +647,7 @@ async function geminiFinalReasoning(
 
   const prompt = `You are a forensic video analyst LOCATING an already-confirmed incident.
 
-PHASE 1 (a separate Gemini agent) has ALREADY screened this video and CONFIRMED matching moment(s) in this window:
+PHASE 1 (a separate screening agent) has ALREADY screened this video and CONFIRMED matching moment(s) in this window:
 ${flaggedSummary || '(none — locate from frames alone)'}
 
 USER QUERY: "${query}" — meaning: "${interpretation.expanded_meaning}"
@@ -577,9 +655,17 @@ Visual categories that match this query: ${interpretation.visual_categories.join
 
 YOUR JOB IS NOT TO RE-LITIGATE WHETHER THE INCIDENT HAPPENED.
 Phase 1 saw the entire video; trust its description. Your job is:
-1. LOCATE the single most representative "peak" frame for each distinct incident (moment of impact / clearest visible state).
-2. IDENTIFY which detected objects are involved (by object_id) and assign a role to each (e.g. "striking vehicle", "victim", "obstacle hit", "second vehicle", "bystander").
-3. Refine the textual description to match the YOLO-annotated visual evidence.
+1. LOCATE the single most representative "peak" frame for each distinct incident (moment of impact / clearest visible state). Set "incident_frame_idx" to this frame's index.
+2. IDENTIFY which detected objects IN THAT SPECIFIC PEAK FRAME are involved. You MUST ONLY reference object_ids from the SAME frame as incident_frame_idx. For example, if incident_frame_idx is 5, only use object_ids starting with "f5_" (like "f5_o0", "f5_o1", etc.).
+3. Use the BBOX POSITIONS to pick the correct object. The vehicle nearest to the collision point / barrier / obstacle is the "striking vehicle". Do NOT just pick the first or largest detection — look at WHERE each bbox is relative to the incident location in the image.
+4. Assign a role to each involved object (e.g. "striking vehicle", "victim", "obstacle hit", "second vehicle", "bystander").
+5. Refine the textual description to match the YOLO-annotated visual evidence.
+
+BBOX POSITION RULES:
+- The bbox coordinates [ymin, xmin, ymax, xmax] are normalized 0–1000. Use these to determine SPATIAL position.
+- The vehicle that is closest to / overlapping with the barrier, obstacle, or point of impact is the striking vehicle.
+- Vehicles far from the incident point are bystanders, NOT involved parties.
+- If multiple objects of the same type (e.g. multiple "car" detections) exist, use their position to distinguish the actual involved vehicle from passing traffic.
 
 If YOLO missed the obstacle/target (e.g. traffic barriers, debris, road furniture not in the class list), DO NOT downgrade — Phase 1 already saw it. Describe it textually under "description" and only list the visible parties under involved_objects.
 
@@ -605,7 +691,10 @@ Return ONLY a JSON object with this EXACT shape:
   ]
 }
 
-CRITICAL: only return { "incidents": [] } if you can clearly prove Phase 1's findings are contradicted by the YOLO evidence (e.g. the window shows an empty road with zero relevant objects). When in doubt, return at least one incident built from Phase 1's description and the most plausible peak frame.`;
+IMPORTANT RULES:
+- involved_objects MUST ONLY contain object_ids from the peak frame (incident_frame_idx). Never reference objects from other frames.
+- Use bbox spatial positions to distinguish the actual striking/involved vehicle from bystander traffic.
+- Only return { "incidents": [] } if you can clearly prove Phase 1's findings are contradicted by the YOLO evidence (e.g. the window shows an empty road with zero relevant objects). When in doubt, return at least one incident.`;
 
   const parts: any[] = [{ text: prompt }];
   for (const d of sentFrames) {
@@ -614,20 +703,10 @@ CRITICAL: only return { "incidents": [] } if you can clearly prove Phase 1's fin
     });
   }
 
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey.trim()}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
-    })
-  });
-
-  if (!res.ok) {
-    throw new Error(`Gemini reasoning failed: ${await res.text()}`);
-  }
-
-  const data = await res.json();
+  const data = await geminiCall(apiKey, {
+    contents: [{ parts }],
+    generationConfig: { responseMimeType: "application/json", temperature: 0.2 }
+  }, onLog);
   const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
   let parsed: any = {};
   try { parsed = JSON.parse(rawText); } catch {
@@ -850,7 +929,7 @@ export default function App() {
   const [query, setQuery] = useState('');
   const [logs, setLogs] = useState<LogEntry[]>(() => [
     createLog('info', 'Scamtir Video Intelligence Engine initialized.'),
-    createLog('info', 'Powered by Gemini Multimodal API.'),
+    createLog('info', 'Powered by Scamtir Intelligence Engine.'),
     createLog('info', 'Upload a video or connect a stream to begin.'),
   ]);
   const [analyzing, setAnalyzing] = useState(false);
@@ -867,6 +946,9 @@ export default function App() {
   const [queryHistory, setQueryHistory] = useState<string[]>([]);
   const [scanStart, setScanStart] = useState<number>(0);
   const [scanEnd, setScanEnd] = useState<number>(0);
+
+  // Global YOLO detections — ALL frames from ALL analyzed windows, sorted by frame_sec
+  const [allYoloDetections, setAllYoloDetections] = useState<YoloDetection[]>([]);
 
   // Rendered video rect within the wrapper — letterbox/pillarbox aware so bboxes line up exactly
   const [videoFitRect, setVideoFitRect] = useState({ left: 0, top: 0, width: 0, height: 0 });
@@ -918,15 +1000,15 @@ export default function App() {
     // Check if key is in .env (and isn't the placeholder string)
     if (ENV_API_KEY && ENV_API_KEY.length > 10 && !ENV_API_KEY.includes('your_')) {
       setGeminiApiKey(ENV_API_KEY);
-      setLogs(prev => [...prev, createLog('success', 'Gemini API key loaded from .env')]);
+      setLogs(prev => [...prev, createLog('success', 'API key loaded from .env')]);
     } else {
       const saved = localStorage.getItem('scamtir_gemini_key');
       if (saved && saved.length > 10) {
         setGeminiApiKey(saved);
-        setLogs(prev => [...prev, createLog('success', 'Gemini API key loaded from local storage.')]);
+        setLogs(prev => [...prev, createLog('success', 'API key loaded from local storage.')]);
       } else {
         setShowApiKeyModal(true);
-        setLogs(prev => [...prev, createLog('warn', 'Gemini API key not initialized. Please enter your key to enable video analysis.')]);
+        setLogs(prev => [...prev, createLog('warn', 'API key not initialized. Please enter your key to enable video analysis.')]);
       }
     }
   }, []);
@@ -1003,6 +1085,7 @@ export default function App() {
     setIncidents([]);
     setActiveIncidentId(null);
     setInspectIncidentId(null);
+    setAllYoloDetections([]);
     setPipelineOptimizedFile(null);
     setPipelineGeminiUri(null);
     setPipelineScreenedSegments(null);
@@ -1079,7 +1162,7 @@ export default function App() {
     setGeminiApiKey(key);
     localStorage.setItem('scamtir_gemini_key', key);
     setShowApiKeyModal(false);
-    addLog('success', 'Gemini API key saved.');
+    addLog('success', 'API key saved.');
   }, [addLog]);
 
   // Real Gemini analysis
@@ -1127,14 +1210,14 @@ export default function App() {
       }
 
       // Step 1a: Upload to Gemini File API (one-shot, memoized)
-      setProg({ phase: 'upload', message: 'Uploading video to Gemini File API...' });
+      setProg({ phase: 'upload', message: 'Uploading video to Scamtir...' });
       let currentGeminiUri = pipelineGeminiUri;
       if (!currentGeminiUri) {
         const fileInfo = await uploadVideoToGemini(geminiApiKey, currentOptFile, msg => addLog('info', msg));
         currentGeminiUri = { fileUri: fileInfo.fileUri, mimeType: fileInfo.mimeType };
         setPipelineGeminiUri(currentGeminiUri);
       } else {
-        addLog('info', `⏭️ Skip: Video already ACTIVE on Gemini servers.`);
+        addLog('info', `⏭️ Skip: Video already ACTIVE on Scamtir servers.`);
       }
 
       // Phase 0 — Interpret the query (broad → specific visual cues + class hints)
@@ -1200,6 +1283,15 @@ export default function App() {
 
         const detections = await yoloDetectSegment(videoFile, w.start, w.end, YOLO_WINDOW_FPS, currentInterpretation.target_objects, msg => addLog('info', msg));
 
+        // Stream YOLO detections into global state immediately for live tracking overlay
+        if (detections.length > 0) {
+          setAllYoloDetections(prev => {
+            const merged = [...prev, ...detections];
+            merged.sort((a, b) => a.frame_sec - b.frame_sec);
+            return merged;
+          });
+        }
+
         setProg({ phase: 'reason', message: `Phase 3: window ${i + 1}/${windows.length} reasoning over ${detections.length} frames...` });
         const incs = await geminiFinalReasoning(
           geminiApiKey,
@@ -1245,7 +1337,7 @@ export default function App() {
       addLog('error', `API error: ${errMsg}`);
       setProg({ phase: 'error', message: errMsg });
       if (errMsg.includes('401') || errMsg.includes('403')) {
-        addLog('error', 'Invalid API key. Please re-enter your Gemini API key.');
+        addLog('error', 'Invalid API key. Please re-enter your API key.');
         setShowApiKeyModal(true);
       }
     } finally {
@@ -1277,6 +1369,20 @@ export default function App() {
   const activeIncident = activeIncidents.find(i => i.id === activeIncidentId) || activeIncidents[0] || null;
   const inspectIncident = inspectIncidentId != null ? incidents.find(i => i.id === inspectIncidentId) || null : null;
 
+  // Find the YOLO frame closest to the current playback time for live tracking
+  const currentFrameDetections = (() => {
+    if (allYoloDetections.length === 0) return null;
+    let best = allYoloDetections[0];
+    let bestDelta = Math.abs(best.frame_sec - currentTime);
+    for (const d of allYoloDetections) {
+      const delta = Math.abs(d.frame_sec - currentTime);
+      if (delta < bestDelta) { best = d; bestDelta = delta; }
+    }
+    // Only show if within 1s of a detection frame
+    if (bestDelta > 1.0) return null;
+    return best;
+  })();
+
   return (
     <div className="app-layout">
       {/* ===== LEFT: VIDEO VIEWPORT ===== */}
@@ -1285,7 +1391,6 @@ export default function App() {
         <div className="viewport-header">
           <div className="viewport-brand">
             <div className="viewport-brand-logo">SCAMTIR<span>.</span></div>
-            <div className="viewport-brand-badge">Gemini AI</div>
           </div>
           <div className="viewport-status">
             <div className="status-indicator">
@@ -1327,7 +1432,7 @@ export default function App() {
                   </div>
                 </div>
               )}
-              {/* Bounding box layer — exactly the rendered video pixels (letterbox/pillarbox aware) */}
+              {/* Detection overlay layer — YOLO tracking + incident heatmap */}
               {videoFitRect.width > 0 && (
                 <div
                   className="bbox-layer"
@@ -1341,33 +1446,81 @@ export default function App() {
                     zIndex: 5,
                   }}
                 >
-                  {activeIncidents.flatMap(inc =>
-                    inc.involved.map((obj, i) => {
-                      const [ymin, xmin, ymax, xmax] = obj.bbox;
-                      const top = `${(ymin / 1000) * 100}%`;
-                      const left = `${(xmin / 1000) * 100}%`;
-                      const width = `${((xmax - xmin) / 1000) * 100}%`;
-                      const height = `${((ymax - ymin) / 1000) * 100}%`;
-                      const isActive = inc.id === (activeIncident?.id ?? -1);
-                      return (
-                        <div
-                          key={`bbox-${inc.id}-${i}`}
-                          className={`bounding-box-overlay ${isActive ? 'is-active' : ''}`}
-                          style={{ top, left, width, height, '--bbox-color': inc.color } as React.CSSProperties}
-                          title={`${obj.role} (${obj.label} ${(obj.yoloConfidence * 100).toFixed(0)}%) — ${inc.eventType}`}
-                        >
-                          <div className="bbox-label" style={{ background: inc.color }}>
-                            <span className="bbl-role">{obj.role}</span>
-                            <span className="bbl-class">{obj.label}</span>
-                          </div>
-                          <div className="bbox-corner top-left" />
-                          <div className="bbox-corner top-right" />
-                          <div className="bbox-corner bottom-left" />
-                          <div className="bbox-corner bottom-right" />
+                  {/* Live YOLO tracking boxes — all detected objects at current playback time */}
+                  {currentFrameDetections && currentFrameDetections.objects.map((obj, i) => {
+                    const [ymin, xmin, ymax, xmax] = obj.bbox;
+                    const top = `${(ymin / 1000) * 100}%`;
+                    const left = `${(xmin / 1000) * 100}%`;
+                    const width = `${((xmax - xmin) / 1000) * 100}%`;
+                    const height = `${((ymax - ymin) / 1000) * 100}%`;
+                    return (
+                      <div
+                        key={`yolo-${i}`}
+                        style={{
+                          position: 'absolute',
+                          top, left, width, height,
+                          border: '1.5px solid rgba(52, 211, 153, 0.6)',
+                          borderRadius: '2px',
+                        }}
+                      >
+                        <div style={{
+                          position: 'absolute',
+                          top: '-16px',
+                          left: '0',
+                          background: 'rgba(52, 211, 153, 0.7)',
+                          color: '#fff',
+                          fontSize: '9px',
+                          fontFamily: 'var(--font-mono)',
+                          padding: '1px 4px',
+                          borderRadius: '2px',
+                          whiteSpace: 'nowrap',
+                          lineHeight: '1.3',
+                        }}>
+                          {obj.label} {(obj.confidence * 100).toFixed(0)}%
                         </div>
-                      );
-                    })
-                  )}
+                      </div>
+                    );
+                  })}
+                  {/* Incident heatmap — radial gradient blobs at collision zones */}
+                  {activeIncidents.map(inc => {
+                    // Use the involved objects' bboxes to compute the center of the collision zone
+                    const bboxes = inc.involved.map(o => o.bbox);
+                    let cx = 500, cy = 500; // default center
+                    if (bboxes.length > 0) {
+                      // Average the centers of all involved bboxes
+                      const centers = bboxes.map(([ymin, xmin, ymax, xmax]) => ({
+                        x: (xmin + xmax) / 2,
+                        y: (ymin + ymax) / 2,
+                      }));
+                      cx = centers.reduce((s, c) => s + c.x, 0) / centers.length;
+                      cy = centers.reduce((s, c) => s + c.y, 0) / centers.length;
+                    }
+                    // Compute a radius proportional to the spread of involved objects
+                    const spread = bboxes.length > 1
+                      ? Math.max(...bboxes.map(([ymin, xmin, ymax, xmax]) =>
+                          Math.hypot((xmin + xmax) / 2 - cx, (ymin + ymax) / 2 - cy)
+                        )) / 1000 * 100
+                      : 8;
+                    const radius = Math.max(6, Math.min(20, spread + 5));
+                    return (
+                      <div
+                        key={`heatmap-${inc.id}`}
+                        style={{
+                          position: 'absolute',
+                          left: `${(cx / 1000) * 100}%`,
+                          top: `${(cy / 1000) * 100}%`,
+                          width: `${radius * 2}%`,
+                          height: `${radius * 2}%`,
+                          transform: 'translate(-50%, -50%)',
+                          background: `radial-gradient(ellipse at center, ${inc.color}55 0%, ${inc.color}22 40%, transparent 70%)`,
+                          borderRadius: '50%',
+                          animation: 'heatmapPulse 2s ease-in-out infinite',
+                          pointerEvents: 'none',
+                        }}
+                        title={`${inc.eventType}: ${inc.description}`}
+                      />
+                    );
+                  })}
                 </div>
               )}
               {/* Active incident badge */}
@@ -1491,12 +1644,12 @@ export default function App() {
       <div className="console-panel">
         {/* Console Header */}
         <div className="console-header">
-          <div className="console-header-icon gemini-icon">
-            <IconGemini />
+          <div className="console-header-icon">
+            <IconCamera />
           </div>
           <div className="console-header-text">
-            <h2>AI Query Console</h2>
-            <p>Natural Language Video Intelligence</p>
+            <h2>SCAMTIR<span>.</span></h2>
+            <p>AI Video Intelligence Console</p>
           </div>
         </div>
 
@@ -1564,7 +1717,7 @@ export default function App() {
                 className="query-search-btn"
                 onClick={runAnalysis}
                 disabled={analyzing}
-                title="Analyze with Gemini"
+                title="Run Analysis"
                 id="query-search-btn"
               >
                 {analyzing ? <div className="spinner" /> : <IconSearch />}
@@ -1646,7 +1799,7 @@ export default function App() {
               </>
             ) : (
               <>
-                <IconGemini />
+
                 Run Multi-Phase Analysis
               </>
             )}
@@ -1661,12 +1814,12 @@ export default function App() {
               </div>
               <div className="pp-message">{progress.message}</div>
               <div className="pp-steps">
-                <div className={`pp-step ${['screen','yolo','reason','done'].includes(progress.phase) ? 'done' : progress.phase === 'compress' || progress.phase === 'upload' ? 'active' : ''}`}>
+                <div className={`pp-step ${['screen', 'yolo', 'reason', 'done'].includes(progress.phase) ? 'done' : progress.phase === 'compress' || progress.phase === 'upload' ? 'active' : ''}`}>
                   <span className="pp-step-num">1</span>
                   <span className="pp-step-name">Upload</span>
                   <span className="pp-step-detail">{progress.phase === 'compress' ? 'compressing' : progress.phase === 'upload' ? 'uploading' : ''}</span>
                 </div>
-                <div className={`pp-step ${['yolo','reason','done'].includes(progress.phase) ? 'done' : progress.phase === 'screen' ? 'active' : ''}`}>
+                <div className={`pp-step ${['yolo', 'reason', 'done'].includes(progress.phase) ? 'done' : progress.phase === 'screen' ? 'active' : ''}`}>
                   <span className="pp-step-num">2</span>
                   <span className="pp-step-name">Screen</span>
                   <span className="pp-step-detail">{progress.batchesTotal > 0 ? `${progress.batchesDone}/${progress.batchesTotal} batches` : ''}</span>
@@ -1766,7 +1919,7 @@ export default function App() {
         <div className="console-footer">
           <div className="console-footer-info">
             <div className={`status-dot ${analyzing ? '' : geminiApiKey ? 'inactive' : ''}`} style={{ width: 6, height: 6 }} />
-            {analyzing ? 'Gemini Processing...' : geminiApiKey ? 'Ready' : 'No API Key'}
+            {analyzing ? 'Scamtir Processing...' : geminiApiKey ? 'Ready' : 'No API Key'}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <button
@@ -1776,7 +1929,7 @@ export default function App() {
             >
               ⚙ API Key
             </button>
-            <div className="console-footer-version">v3.0.0-gemini</div>
+            <div className="console-footer-version">v3.0.0-scamtir</div>
           </div>
         </div>
       </div>
@@ -1787,10 +1940,10 @@ export default function App() {
           <div className="modal-card" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
               <div className="modal-icon">
-                <IconGemini />
+                <IconCamera />
               </div>
               <div>
-                <h3 className="modal-title">Gemini API Key</h3>
+                <h3 className="modal-title">Scamtir API Key</h3>
                 <p className="modal-subtitle">Required to analyze video with AI</p>
               </div>
             </div>
@@ -1849,7 +2002,7 @@ export default function App() {
           <div className="modal-card inspector-card" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
               <div className="modal-icon" style={{ background: inspectIncident.color }}>
-                <IconGemini />
+                <IconCamera />
               </div>
               <div style={{ flex: 1 }}>
                 <h3 className="modal-title">

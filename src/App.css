@@ -1416,7 +1416,7 @@
 .pp-step.active .pp-step-num {
   background: var(--accent-indigo);
   color: #fff;
-  animation: geminiGlow 1.5s ease-in-out infinite;
+  animation: scamtirGlow 1.5s ease-in-out infinite;
 }
 
 .pp-step-name {
