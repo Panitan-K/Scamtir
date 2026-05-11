@@ -38,3 +38,8 @@ venv/
 .claude/worktrees/
 .claude/launch.json
 .claude/settings.local.json
+
+# Next.js
+.next/
+out/
+next-env.d.ts
