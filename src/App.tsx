@@ -9,18 +9,18 @@ const ENV_API_KEY = (process.env.NEXT_PUBLIC_GEMINI_API_KEY as string | undefine
 const BACKEND_URL = (process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000').replace(/\/$/, '');
 
 // ===== GEMINI MODEL FALLBACK CHAIN =====
-// Ordered by preference. On HTTP 429 (rate limit), the caller automatically rotates to the next model.
-// Flash variants are preferred (faster, higher RPM); Pro is the last resort (slower, lower RPM but separate quota).
+// Ordered by preference. On HTTP 429 (rate limit) or 403 (model access denied),
+// the caller automatically rotates to the next model.
 const GEMINI_MODELS = [
-  'gemini-3-flash-preview',
   'gemini-2.5-flash',
   'gemini-2.0-flash',
+  'gemini-1.5-flash',
 ] as const;
 
 const MODEL_DISPLAY_NAMES: Record<string, string> = {
-  'gemini-3-flash-preview': 'Scamtir Model 1',
-  'gemini-2.5-flash': 'Scamtir Model 2',
-  'gemini-2.0-flash': 'Scamtir Model 3',
+  'gemini-2.5-flash': 'Scamtir Model 1',
+  'gemini-2.0-flash': 'Scamtir Model 2',
+  'gemini-1.5-flash': 'Scamtir Model 3',
 };
 const getModelName = (m: string) => MODEL_DISPLAY_NAMES[m] || m;
 
@@ -83,8 +83,17 @@ async function geminiCall(
       continue;
     }
 
+    if (res.status === 403) {
+      // Project denied access to this specific model — skip it for the session and try the next
+      _modelCooldowns.set(model, Date.now() + 24 * 60 * 60 * 1000);
+      const errText = await res.text().catch(() => '');
+      onLog?.(`   ⚠️ ${getModelName(model)} access denied (403) — rotating to next model...`);
+      lastErr = new Error(`HTTP 403 from ${getModelName(model)}: ${errText}`);
+      continue;
+    }
+
     if (!res.ok) {
-      // Non-429 HTTP error — propagate immediately (auth errors, bad request, etc.)
+      // Other HTTP errors (400 bad request, 401 invalid key, etc.) — propagate immediately
       const errText = await res.text().catch(() => '');
       throw new Error(`HTTP ${res.status} from ${getModelName(model)}: ${errText}`);
     }
@@ -98,8 +107,8 @@ async function geminiCall(
     return await res.json();
   }
 
-  // Every model returned 429
-  throw lastErr ?? new Error('All Scamtir models exhausted (429 rate-limited)');
+  // Every model returned 429 or 403
+  throw lastErr ?? new Error('All Scamtir models exhausted (rate-limited or access denied)');
 }
 
 // ===== TYPES =====
