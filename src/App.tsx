@@ -1,9 +1,12 @@
+'use client'
+
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import './App.css';
 
-const ENV_API_KEY = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined)?.trim();
+const ENV_API_KEY = (process.env.NEXT_PUBLIC_GEMINI_API_KEY as string | undefined)?.trim();
+const BACKEND_URL = (process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000').replace(/\/$/, '');
 
 // ===== GEMINI MODEL FALLBACK CHAIN =====
 // Ordered by preference. On HTTP 429 (rate limit), the caller automatically rotates to the next model.
@@ -574,7 +577,7 @@ async function yoloDetectSegment(
   formData.append('yolo_fps', yoloFps.toString());
   formData.append('classes', merged.join(','));
 
-  const res = await fetch('http://localhost:8000/yolo_detect', {
+  const res = await fetch(`${BACKEND_URL}/yolo_detect`, {
     method: 'POST',
     body: formData,
   });
@@ -980,7 +983,7 @@ export default function App() {
   useEffect(() => {
     const checkBackend = async () => {
       try {
-        const res = await fetch('http://localhost:8000/health');
+        const res = await fetch(`${BACKEND_URL}/health`);
         if (res.ok) {
           setBackendStatus('online');
         } else {
@@ -1964,7 +1967,7 @@ export default function App() {
                 autoFocus
               />
               <p className="modal-note">
-                Stored in browser localStorage. Add <code>VITE_GEMINI_API_KEY</code> to <code>.env</code> to skip this prompt.
+                Stored in browser localStorage. Add <code>NEXT_PUBLIC_GEMINI_API_KEY</code> to <code>.env.local</code> to skip this prompt.
               </p>
             </div>
             <div className="modal-actions">
